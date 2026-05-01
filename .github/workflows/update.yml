@@ -16,11 +16,11 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Download source file
+      - name: Download source
         run: |
-          curl -s -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+          curl -fLsS -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt || exit 1
 
-      - name: Build custom list
+      - name: Build list
         run: |
           grep -v '^#' original.txt | grep -v '^$' > clean.txt
 
@@ -58,7 +58,7 @@ jobs:
 
           git add white-list.txt
 
-          git commit -m "🔥 Auto update VPN list" || exit 0
+          git commit -m "🔥 auto update" || exit 0
 
       - name: Push changes
         run: |
