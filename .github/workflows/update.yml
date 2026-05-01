@@ -14,7 +14,7 @@ jobs:
         run: |
           curl -fLsS -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
-      - name: Build file
+      - name: Build VPN file
         run: |
           grep -v '^#' original.txt | grep -v '^$' > clean.txt
 
@@ -29,12 +29,11 @@ jobs:
             echo "# profile-title: 🔥M3owMeres VPN | CLEAN | $VERSION"
             echo "# update: $DATE $TIME"
             echo "# servers: $COUNT"
-            echo "# mode: NO GIT - PAGES ONLY"
             echo ""
             cat clean.txt
           } > public/white-list.txt
 
-      - name: Upload artifact
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
@@ -48,5 +47,5 @@ jobs:
       id-token: write
 
     steps:
-      - name: Deploy
+      - name: Deploy to Pages
         uses: actions/deploy-pages@v4
