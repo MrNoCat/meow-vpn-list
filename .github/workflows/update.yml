@@ -13,14 +13,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Download source
+      - name: Download source file
         run: |
           curl -s -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
-      - name: Process config
+      - name: Build custom list
         run: |
           grep -v '^#' original.txt | grep -v '^$' > clean.txt
 
@@ -51,10 +51,15 @@ jobs:
 
           } > white-list.txt
 
-      - name: Commit and push
+      - name: Commit changes
         run: |
           git config user.name "meow-bot"
           git config user.email "meow@vpn.com"
+
           git add white-list.txt
-          git commit -m "🔥 Auto update" || exit 0
-          git push
+
+          git commit -m "🔥 Auto update VPN list" || exit 0
+
+      - name: Push changes
+        run: |
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
