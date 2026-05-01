@@ -1,0 +1,64 @@
+name: Meow VPN Auto Update
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download source
+        run: |
+          curl -s -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+
+      - name: Process config
+        run: |
+          # Убираем комментарии и пустые строки
+          grep -v '^#' original.txt | grep -v '^$' > clean.txt
+
+          # Считаем количество серверов
+          COUNT=$(wc -l < clean.txt)
+
+          # Дата и версия
+          DATE=$(date +"%d.%m.%Y")
+          TIME=$(date +"%H:%M")
+
+          # Генерация версии (рандом)
+          VERSION="v$((RANDOM%9+1)).$((RANDOM%10)).$((RANDOM%10))"
+
+          # Создаем итоговый файл
+          {
+            echo "# profile-title: 🔥M3owMeres VPN | WHITE LIST | $VERSION"
+            echo "# update: $DATE $TIME"
+            echo "# servers: $COUNT"
+            echo ""
+
+            # Добавляем флаги к серверам
+            while read line; do
+              if echo "$line" | grep -qi "ru"; then
+                echo "$line # 🇷🇺"
+              elif echo "$line" | grep -qi "us"; then
+                echo "$line # 🇺🇸"
+              elif echo "$line" | grep -qi "de"; then
+                echo "$line # 🇩🇪"
+              elif echo "$line" | grep -qi "nl"; then
+                echo "$line # 🇳🇱"
+              else
+                echo "$line # 🌍"
+              fi
+            done < clean.txt
+
+          } > white-list.txt
+
+      - name: Push changes
+        run: |
+          git config --global user.name "meow-bot"
+          git config --global user.email "meow@vpn.com"
+          git add white-list.txt
+          git commit -m "🔥 Auto update VPN list" || echo "No changes"
+          git push
