@@ -1,4 +1,4 @@
-name: Meow VPN Auto Build
+name: Meow VPN Auto Pages Build
 
 on:
   schedule:
@@ -14,7 +14,7 @@ jobs:
         run: |
           curl -fLsS -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
-      - name: Build VPN list
+      - name: Build file
         run: |
           grep -v '^#' original.txt | grep -v '^$' > clean.txt
 
@@ -25,17 +25,38 @@ jobs:
 
           {
             echo "# profile-title: 🔥M3owMeres VPN | CLEAN | $VERSION"
-            echo "# compatible: Happ / V2rayTun"
             echo "# update: $DATE $TIME"
             echo "# servers: $COUNT"
+            echo "# source: Happ / V2rayTun"
             echo ""
 
             cat clean.txt
 
           } > white-list.txt
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Publish to repo (no git conflicts)
+        run: |
+          mkdir -p public
+          cp white-list.txt public/white-list.txt
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: vpn-list
-          path: white-list.txt
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
