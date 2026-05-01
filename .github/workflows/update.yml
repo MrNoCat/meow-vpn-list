@@ -13,7 +13,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Download source
         run: |
@@ -21,27 +22,19 @@ jobs:
 
       - name: Process config
         run: |
-          # Убираем комментарии и пустые строки
           grep -v '^#' original.txt | grep -v '^$' > clean.txt
 
-          # Считаем количество серверов
           COUNT=$(wc -l < clean.txt)
-
-          # Дата и версия
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-
-          # Генерация версии (рандом)
           VERSION="v$((RANDOM%9+1)).$((RANDOM%10)).$((RANDOM%10))"
 
-          # Создаем итоговый файл
           {
             echo "# profile-title: 🔥M3owMeres VPN | WHITE LIST | $VERSION"
             echo "# update: $DATE $TIME"
             echo "# servers: $COUNT"
             echo ""
 
-            # Добавляем флаги к серверам
             while read line; do
               if echo "$line" | grep -qi "ru"; then
                 echo "$line # 🇷🇺"
@@ -58,10 +51,10 @@ jobs:
 
           } > white-list.txt
 
-      - name: Push changes
+      - name: Commit and push
         run: |
-          git config --global user.name "meow-bot"
-          git config --global user.email "meow@vpn.com"
+          git config user.name "meow-bot"
+          git config user.email "meow@vpn.com"
           git add white-list.txt
-          git commit -m "🔥 Auto update VPN list" || echo "No changes"
+          git commit -m "🔥 Auto update" || exit 0
           git push
