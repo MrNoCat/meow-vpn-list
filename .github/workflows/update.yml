@@ -33,11 +33,10 @@ jobs:
           mkdir -p public
 
           {
-            echo "# profile-title: 🔥M3owMeres VPN | CLEAN | $VERSION"
+            echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# compatible: Happ / V2rayTun"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
-            echo "# mode: PAGES ONLY (no git push)"
             echo ""
 
             cat clean.txt
