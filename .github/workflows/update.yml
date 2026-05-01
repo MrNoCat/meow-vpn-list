@@ -1,28 +1,20 @@
-name: Meow VPN Auto Update
+name: Meow VPN Auto Build
 
 on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  update:
+  build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download VPN list
+      - name: Download source
         run: |
           curl -fLsS -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
-      - name: Build clean profile (no sorting)
+      - name: Build VPN list
         run: |
           grep -v '^#' original.txt | grep -v '^$' > clean.txt
 
@@ -36,31 +28,14 @@ jobs:
             echo "# compatible: Happ / V2rayTun"
             echo "# update: $DATE $TIME"
             echo "# servers: $COUNT"
-            echo "# mode: RAW LIST (no priority)"
             echo ""
 
-            while read line; do
-              if echo "$line" | grep -qi "ru"; then
-                echo "$line # 🇷🇺"
-              elif echo "$line" | grep -qi "us"; then
-                echo "$line # 🇺🇸"
-              elif echo "$line" | grep -qi "de"; then
-                echo "$line # 🇩🇪"
-              else
-                echo "$line # 🌍"
-              fi
-            done < clean.txt
+            cat clean.txt
 
           } > white-list.txt
 
-      - name: Commit changes
-        run: |
-          git config user.name "meow-bot"
-          git config user.email "meow@vpn.com"
-
-          git add white-list.txt
-          git commit -m "🔥 Auto update VPN list" || exit 0
-
-      - name: Push changes (safe)
-        run: |
-          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-list
+          path: white-list.txt
