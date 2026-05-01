@@ -18,11 +18,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download source
+      - name: Download VPN list
         run: |
           curl -fLsS -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
-      - name: Build VPN list
+      - name: Build clean profile (no sorting)
         run: |
           grep -v '^#' original.txt | grep -v '^$' > clean.txt
 
@@ -32,9 +32,11 @@ jobs:
           VERSION="v$((RANDOM%9+1)).$((RANDOM%10)).$((RANDOM%10))"
 
           {
-            echo "# profile-title: 🔥M3owMeres VPN | WHITE LIST | $VERSION"
+            echo "# profile-title: 🔥M3owMeres VPN | CLEAN | $VERSION"
+            echo "# compatible: Happ / V2rayTun"
             echo "# update: $DATE $TIME"
             echo "# servers: $COUNT"
+            echo "# mode: RAW LIST (no priority)"
             echo ""
 
             while read line; do
@@ -44,8 +46,6 @@ jobs:
                 echo "$line # 🇺🇸"
               elif echo "$line" | grep -qi "de"; then
                 echo "$line # 🇩🇪"
-              elif echo "$line" | grep -qi "nl"; then
-                echo "$line # 🇳🇱"
               else
                 echo "$line # 🌍"
               fi
@@ -59,9 +59,8 @@ jobs:
           git config user.email "meow@vpn.com"
 
           git add white-list.txt
-
           git commit -m "🔥 Auto update VPN list" || exit 0
 
-      - name: Force push (FIX ALL ERRORS)
+      - name: Push changes (safe)
         run: |
-          git push --force https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
