@@ -18,6 +18,35 @@ jobs:
         run: |
           curl -fLsS -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
+      # =========================
+      # AUTO DETECT CHANGES
+      # =========================
+      - name: Check updates (auto detect)
+        id: check
+        run: |
+          NEW_HASH=$(sha256sum original.txt | cut -d' ' -f1)
+
+          if [ -f last_hash.txt ]; then
+            OLD_HASH=$(cat last_hash.txt)
+          else
+            OLD_HASH=""
+          fi
+
+          if [ "$NEW_HASH" = "$OLD_HASH" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo $NEW_HASH > last_hash.txt
+
+      # если нет изменений — стопаем workflow
+      - name: Skip if no changes
+        if: steps.check.outputs.changed == 'false'
+        run: |
+          echo "No changes → skipping build"
+          exit 0
+
       - name: Build VPN file (MSK time)
         run: |
           export TZ=Europe/Moscow
@@ -27,8 +56,6 @@ jobs:
           COUNT=$(wc -l < clean.txt)
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-
-          VERSION="v$((RANDOM%9+1)).$((RANDOM%10)).$((RANDOM%10))"
 
           mkdir -p public
 
