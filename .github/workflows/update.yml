@@ -16,8 +16,7 @@ jobs:
     steps:
       - name: Download VPN list
         run: |
-          curl -fLsS -o original.txt https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_lite.txt
-
+          curl -fLsS -o original.txt https://github.com/igareck/vpn-configs-for-russia/raw/refs/heads/main/WHITE-CIDR-RU-checked.txt
       # =========================
       # AUTO DETECT CHANGES
       # =========================
