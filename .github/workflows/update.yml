@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: Download VPN list
         run: |
-          curl -fLsS -o original.txt https://github.com/igareck/vpn-configs-for-russia/raw/refs/heads/main/WHITE-CIDR-RU-checked.txt
+          curl -fLsS -o original.txt https://raw.githubusercontent.com/ByeWhiteLists/ByeWhiteLists2/refs/heads/main/ByeWhiteLists2.txt
       # =========================
       # AUTO DETECT CHANGES
       # =========================
