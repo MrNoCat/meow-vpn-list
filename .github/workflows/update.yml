@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: Download VPN list
         run: |
-          curl -fLsS -o original.txt https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_lite.txt
+          curl -fLsS -o original.txt https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/refs/heads/main/githubmirror/26.txt
       # =========================
       # AUTO DETECT CHANGES
       # =========================
