@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: Download VPN list
         run: |
-          curl -fLsS -o original.txt https://raw.githubusercontent.com/GoldCaviar/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+          curl -fLsS -o original.txt https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_lite.txt
 
       # =========================
       # AUTO DETECT CHANGES
