@@ -18,87 +18,85 @@ jobs:
         run: |
           curl -fLsS -o original.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
 
-      - name: Build SMART whitelist
+      - name: Build smart whitelist
         run: |
+          set -euo pipefail
+
           export TZ=Europe/Moscow
           mkdir -p public
 
           # =========================
-          # CLEAN
+          # CLEAN INPUT
           # =========================
           grep -v '^#' original.txt \
           | grep -v '^$' \
           | tr -d '\r' \
-          | sed 's/[[:space:]]//g' > clean.txt
+          | sed 's/[[:space:]]//g' > clean.txt || true
+
+          # защита
+          [ -s clean.txt ] || { echo "EMPTY INPUT" > public/white-list.txt; exit 0; }
 
           # =========================
           # VALID DOMAINS ONLY
           # =========================
-          grep -E '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$' clean.txt > domains.txt
+          grep -E '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$' clean.txt > domains.txt || true
+
+          [ -s domains.txt ] || { echo "NO DOMAINS" > public/white-list.txt; exit 0; }
 
           # =========================
-          # BASE DOMAIN NORMALIZATION
+          # NORMALIZE DOMAIN
           # =========================
-          awk -F. '{if (NF>=2) print $(NF-1)"."$NF}' domains.txt \
-          | sort -u > base.txt
+          sed -E 's/^.*\.([a-zA-Z0-9-]+\.[a-zA-Z0-9-]+)$/\1/' domains.txt \
+          | sort -u > base.txt || true
+
+          [ -s base.txt ] || { echo "EMPTY BASE" > public/white-list.txt; exit 0; }
 
           # =========================
-          # 🟢 DIRECT (RU + LOCAL + FINANCE)
+          # DIRECT / PROXY LOGIC
           # =========================
-          grep -E 'yandex|vk|mail|sber|tinkoff|ozon|wildberries|gosuslugi|avito' base.txt > direct.txt || true
+          DIRECT_PATTERNS="yandex|vk|mail|sber|tinkoff|ozon|wildberries|gosuslugi|avito"
+
+          grep -Ei "$DIRECT_PATTERNS" base.txt > direct.txt || true
+          grep -Eiv "$DIRECT_PATTERNS" base.txt > proxy.txt || true
 
           # =========================
-          # 🔵 PROXY (GLOBAL)
+          # CLEAN PROXY NOISE
           # =========================
-          grep -viE 'yandex|vk|mail|sber|tinkoff|ozon|wildberries|gosuslugi|avito' base.txt > proxy.txt
+          grep -viE 'ads|analytics|tracker|doubleclick|googlesyndication|metrics' proxy.txt > proxy_clean.txt || true
 
           # =========================
-          # CLEAN ADS/TRACKERS
+          # MERGE + DEDUP
           # =========================
-          grep -viE 'ads|analytics|tracker|doubleclick|googleadservices' proxy.txt > proxy_clean.txt
+          cat direct.txt proxy_clean.txt | sort -u > smart.txt || true
+
+          [ -s smart.txt ] || { echo "EMPTY LIST" > public/white-list.txt; exit 0; }
 
           # =========================
-          # MERGE SMART ORDER
+          # FINAL VALIDATION
           # =========================
-          {
-            echo "# DIRECT"
-            cat direct.txt
-            echo ""
-            echo "# PROXY"
-            cat proxy_clean.txt
-          } > smart.txt
+          grep -E '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$' smart.txt > final.txt || true
+
+          [ -s final.txt ] || { echo "EMPTY FINAL" > public/white-list.txt; exit 0; }
 
           # =========================
-          # LIMITS (MOBILE OPTIMIZED)
-          # =========================
-          head -n 4000 smart.txt > full.txt
-          head -n 1200 smart.txt > lite.txt
-
-          # =========================
-          # OUTPUT PROTECTION
-          # =========================
-          if [ ! -s full.txt ]; then
-            echo "EMPTY LIST" > public/white-list.txt
-            exit 0
-          fi
-
-          # =========================
-          # METADATA
+          # OUTPUT
           # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          COUNT=$(wc -l < full.txt)
+          COUNT=$(wc -l < final.txt)
 
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
-            echo "# mode: VPN-GRADE AUTO ROUTING"
+            echo "# mode: STABLE ROUTING"
             echo "# update: $DATE $TIME (MSK)"
             echo "# domains: $COUNT"
             echo ""
-            cat full.txt
+            echo "# DIRECT"
+            cat direct.txt | sort -u || true
+            echo ""
+            echo "# PROXY"
+            cat proxy_clean.txt | sort -u || true
           } > public/white-list.txt
-
-          cp lite.txt public/lite.txt
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v4
