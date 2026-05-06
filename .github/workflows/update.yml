@@ -14,62 +14,93 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download VPN list
+      - name: Download source
         run: |
           curl -fLsS -o original.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
-      # =========================
-      # AUTO DETECT CHANGES
-      # =========================
-      - name: Check updates (auto detect)
-        id: check
-        run: |
-          NEW_HASH=$(sha256sum original.txt | cut -d' ' -f1)
 
-          if [ -f last_hash.txt ]; then
-            OLD_HASH=$(cat last_hash.txt)
-          else
-            OLD_HASH=""
-          fi
-
-          if [ "$NEW_HASH" = "$OLD_HASH" ]; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-          fi
-
-          echo $NEW_HASH > last_hash.txt
-
-      # если нет изменений — стопаем workflow
-      - name: Skip if no changes
-        if: steps.check.outputs.changed == 'false'
-        run: |
-          echo "No changes → skipping build"
-          exit 0
-
-      - name: Build VPN file (MSK time)
+      - name: Build SMART whitelist
         run: |
           export TZ=Europe/Moscow
+          mkdir -p public
 
-          grep -v '^#' original.txt | grep -v '^$' > clean.txt
+          # =========================
+          # CLEAN
+          # =========================
+          grep -v '^#' original.txt \
+          | grep -v '^$' \
+          | tr -d '\r' \
+          | sed 's/[[:space:]]//g' > clean.txt
 
-          COUNT=$(wc -l < clean.txt)
+          # =========================
+          # VALID DOMAINS ONLY
+          # =========================
+          grep -E '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$' clean.txt > domains.txt
+
+          # =========================
+          # BASE DOMAIN NORMALIZATION
+          # =========================
+          awk -F. '{if (NF>=2) print $(NF-1)"."$NF}' domains.txt \
+          | sort -u > base.txt
+
+          # =========================
+          # 🟢 DIRECT (RU + LOCAL + FINANCE)
+          # =========================
+          grep -E 'yandex|vk|mail|sber|tinkoff|ozon|wildberries|gosuslugi|avito' base.txt > direct.txt || true
+
+          # =========================
+          # 🔵 PROXY (GLOBAL)
+          # =========================
+          grep -viE 'yandex|vk|mail|sber|tinkoff|ozon|wildberries|gosuslugi|avito' base.txt > proxy.txt
+
+          # =========================
+          # CLEAN ADS/TRACKERS
+          # =========================
+          grep -viE 'ads|analytics|tracker|doubleclick|googleadservices' proxy.txt > proxy_clean.txt
+
+          # =========================
+          # MERGE SMART ORDER
+          # =========================
+          {
+            echo "# DIRECT"
+            cat direct.txt
+            echo ""
+            echo "# PROXY"
+            cat proxy_clean.txt
+          } > smart.txt
+
+          # =========================
+          # LIMITS (MOBILE OPTIMIZED)
+          # =========================
+          head -n 4000 smart.txt > full.txt
+          head -n 1200 smart.txt > lite.txt
+
+          # =========================
+          # OUTPUT PROTECTION
+          # =========================
+          if [ ! -s full.txt ]; then
+            echo "EMPTY LIST" > public/white-list.txt
+            exit 0
+          fi
+
+          # =========================
+          # METADATA
+          # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-
-          mkdir -p public
+          COUNT=$(wc -l < full.txt)
 
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
-            echo "# compatible: Happ / V2rayTun"
+            echo "# mode: VPN-GRADE AUTO ROUTING"
             echo "# update: $DATE $TIME (MSK)"
-            echo "# servers: $COUNT"
+            echo "# domains: $COUNT"
             echo ""
-
-            cat clean.txt
-
+            cat full.txt
           } > public/white-list.txt
 
-      - name: Upload artifact for Pages
+          cp lite.txt public/lite.txt
+
+      - name: Upload artifact
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
@@ -86,5 +117,5 @@ jobs:
       name: github-pages
 
     steps:
-      - name: Deploy to GitHub Pages
+      - name: Deploy
         uses: actions/deploy-pages@v4
