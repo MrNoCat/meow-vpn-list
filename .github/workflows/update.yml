@@ -1,9 +1,9 @@
-name: "@meowmeres 🏳️WHITE LISTS🏳️"
+name: VPN Auto Detect Build
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch:
 
 permissions:
   pages: write
@@ -16,9 +16,9 @@ jobs:
     steps:
       - name: Download source
         run: |
-          curl -fLsS -o original.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+          curl -fLsS -o original.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt
 
-      - name: Build smart whitelist
+      - name: Build VPN list
         run: |
           set -euo pipefail
 
@@ -26,79 +26,62 @@ jobs:
           mkdir -p public
 
           # =========================
-          # CLEAN INPUT
+          # FIX CRLF
           # =========================
-          grep -v '^#' original.txt \
-          | grep -v '^$' \
-          | tr -d '\r' \
-          | sed 's/[[:space:]]//g' > clean.txt || true
-
-          # защита
-          [ -s clean.txt ] || { echo "EMPTY INPUT" > public/white-list.txt; exit 0; }
+          tr -d '\r' < original.txt > fixed.txt
 
           # =========================
-          # VALID DOMAINS ONLY
+          # REMOVE EMPTY LINES
           # =========================
-          grep -E '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$' clean.txt > domains.txt || true
+          grep -v '^$' fixed.txt > clean.txt || true
 
-          [ -s domains.txt ] || { echo "NO DOMAINS" > public/white-list.txt; exit 0; }
-
-          # =========================
-          # NORMALIZE DOMAIN
-          # =========================
-          sed -E 's/^.*\.([a-zA-Z0-9-]+\.[a-zA-Z0-9-]+)$/\1/' domains.txt \
-          | sort -u > base.txt || true
-
-          [ -s base.txt ] || { echo "EMPTY BASE" > public/white-list.txt; exit 0; }
+          [ -s clean.txt ] || { echo "EMPTY INPUT" > public/vpn.txt; exit 0; }
 
           # =========================
-          # DIRECT / PROXY LOGIC
+          # REMOVE [BL] AND [RU]
           # =========================
-          DIRECT_PATTERNS="yandex|vk|mail|sber|tinkoff|ozon|wildberries|gosuslugi|avito"
-
-          grep -Ei "$DIRECT_PATTERNS" base.txt > direct.txt || true
-          grep -Eiv "$DIRECT_PATTERNS" base.txt > proxy.txt || true
+          sed -E 's/[[:space:]]*\[(BL|RU)\][[:space:]]*//g' clean.txt > no_tags.txt
 
           # =========================
-          # CLEAN PROXY NOISE
+          # KEEP ONLY VPN LINKS
           # =========================
-          grep -viE 'ads|analytics|tracker|doubleclick|googlesyndication|metrics' proxy.txt > proxy_clean.txt || true
+          grep -E '^vless://|^trojan://|^ss://' no_tags.txt > vpn.txt || true
+
+          [ -s vpn.txt ] || { echo "NO VPN LINKS" > public/vpn.txt; exit 0; }
 
           # =========================
-          # MERGE + DEDUP
+          # REMOVE DUPLICATES
           # =========================
-          cat direct.txt proxy_clean.txt | sort -u > smart.txt || true
-
-          [ -s smart.txt ] || { echo "EMPTY LIST" > public/white-list.txt; exit 0; }
+          awk '!seen[$0]++' vpn.txt > unique.txt
 
           # =========================
-          # FINAL VALIDATION
+          # LIMIT FOR MOBILE STABILITY
           # =========================
-          grep -E '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$' smart.txt > final.txt || true
-
-          [ -s final.txt ] || { echo "EMPTY FINAL" > public/white-list.txt; exit 0; }
+          head -n 300 unique.txt > limited.txt
 
           # =========================
-          # OUTPUT
+          # RANDOMIZE
           # =========================
+          shuf limited.txt > final.txt
+
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
           COUNT=$(wc -l < final.txt)
 
+          # =========================
+          # OUTPUT
+          # =========================
           {
-            echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
-            echo "# mode: STABLE ROUTING"
-            echo "# update: $DATE $TIME (MSK)"
-            echo "# domains: $COUNT"
+            echo "# profile-title: 🔥MeowMeres VPN"
+            echo "# Date/Time: $DATE $TIME (MSK)"
+            echo "# Servers: $COUNT"
             echo ""
-            echo "# DIRECT"
-            cat direct.txt | sort -u || true
-            echo ""
-            echo "# PROXY"
-            cat proxy_clean.txt | sort -u || true
-          } > public/white-list.txt
+            cat final.txt
+          } > public/vpn.txt
 
-      - name: Upload artifact
+          cp final.txt public/android.txt
+
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
