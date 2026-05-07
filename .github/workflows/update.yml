@@ -1,9 +1,9 @@
-name: VPN Auto Detect Build
+name: "@meowmeres 🏳️WHITE LISTS🏳️"
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
+  workflow_dispatch:
 
 permissions:
   pages: write
@@ -14,74 +14,50 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download source
+      - name: Download VPN list
         run: |
-          curl -fLsS -o original.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt
-
-      - name: Build VPN list
+          curl -fLsS -o original.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+      # =========================
+      # AUTO DETECT CHANGES
+      # =========================
+      - name: Check updates (auto detect)
+        id: check
         run: |
-          set -euo pipefail
-
+          NEW_HASH=$(sha256sum original.txt | cut -d' ' -f1)
+          if [ -f last_hash.txt ]; then
+            OLD_HASH=$(cat last_hash.txt)
+          else
+            OLD_HASH=""
+          fi
+          if [ "$NEW_HASH" = "$OLD_HASH" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+          echo $NEW_HASH > last_hash.txt
+      # если нет изменений — стопаем workflow
+      - name: Skip if no changes
+        if: steps.check.outputs.changed == 'false'
+        run: |
+          echo "No changes → skipping build"
+          exit 0
+      - name: Build VPN file (MSK time)
+        run: |
           export TZ=Europe/Moscow
-          mkdir -p public
-
-          # =========================
-          # FIX CRLF
-          # =========================
-          tr -d '\r' < original.txt > fixed.txt
-
-          # =========================
-          # REMOVE EMPTY LINES
-          # =========================
-          grep -v '^$' fixed.txt > clean.txt || true
-
-          [ -s clean.txt ] || { echo "EMPTY INPUT" > public/vpn.txt; exit 0; }
-
-          # =========================
-          # REMOVE [BL] AND [RU]
-          # =========================
-          sed -E 's/[[:space:]]*\[(BL|RU)\][[:space:]]*//g' clean.txt > no_tags.txt
-
-          # =========================
-          # KEEP ONLY VPN LINKS
-          # =========================
-          grep -E '^vless://|^trojan://|^ss://' no_tags.txt > vpn.txt || true
-
-          [ -s vpn.txt ] || { echo "NO VPN LINKS" > public/vpn.txt; exit 0; }
-
-          # =========================
-          # REMOVE DUPLICATES
-          # =========================
-          awk '!seen[$0]++' vpn.txt > unique.txt
-
-          # =========================
-          # LIMIT FOR MOBILE STABILITY
-          # =========================
-          head -n 300 unique.txt > limited.txt
-
-          # =========================
-          # RANDOMIZE
-          # =========================
-          shuf limited.txt > final.txt
-
+          grep -v '^#' original.txt | grep -v '^$' > clean.txt
+          COUNT=$(wc -l < clean.txt)
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          COUNT=$(wc -l < final.txt)
-
-          # =========================
-          # OUTPUT
-          # =========================
+          mkdir -p public
           {
-            echo "# profile-title: 🔥MeowMeres VPN"
-            echo "# Date/Time: $DATE $TIME (MSK)"
-            echo "# Servers: $COUNT"
+            echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
+            echo "# compatible: Happ / V2rayTun"
+            echo "# update: $DATE $TIME (MSK)"
+            echo "# servers: $COUNT"
             echo ""
-            cat final.txt
-          } > public/vpn.txt
-
-          cp final.txt public/android.txt
-
-      - name: Upload Pages artifact
+            cat clean.txt
+          } > public/white-list.txt
+      - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
@@ -98,5 +74,5 @@ jobs:
       name: github-pages
 
     steps:
-      - name: Deploy
+      - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
