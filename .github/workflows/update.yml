@@ -17,6 +17,7 @@ jobs:
       - name: Download VPN list
         run: |
           curl -fLsS -o original.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+
       # =========================
       # AUTO DETECT CHANGES
       # =========================
@@ -24,39 +25,88 @@ jobs:
         id: check
         run: |
           NEW_HASH=$(sha256sum original.txt | cut -d' ' -f1)
+
           if [ -f last_hash.txt ]; then
             OLD_HASH=$(cat last_hash.txt)
           else
             OLD_HASH=""
           fi
+
           if [ "$NEW_HASH" = "$OLD_HASH" ]; then
             echo "changed=false" >> $GITHUB_OUTPUT
           else
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
+
           echo $NEW_HASH > last_hash.txt
-      # если нет изменений — стопаем workflow
+
+      # =========================
+      # SKIP IF NO CHANGES
+      # =========================
       - name: Skip if no changes
         if: steps.check.outputs.changed == 'false'
         run: |
           echo "No changes → skipping build"
           exit 0
+
+      # =========================
+      # BUILD FILE
+      # =========================
       - name: Build VPN file (MSK time)
         run: |
           export TZ=Europe/Moscow
+
+          # remove comments + empty lines
           grep -v '^#' original.txt | grep -v '^$' > clean.txt
-          COUNT=$(wc -l < clean.txt)
+
+          # remove Russia servers only
+          grep -vi '#.*Russia' clean.txt > filtered.txt || true
+
+          # fallback if empty
+          if [ ! -s filtered.txt ]; then
+            cp clean.txt filtered.txt
+          fi
+
+          COUNT=$(wc -l < filtered.txt)
+
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
+
           mkdir -p public
+
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# compatible: Happ / V2rayTun"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
             echo ""
-            cat clean.txt
+
+            cat filtered.txt
+
           } > public/white-list.txt
+
+      # =========================
+      # INDEX.HTML
+      # =========================
+      - name: Create index.html
+        run: |
+          cat > public/index.html <<EOF
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>MeowMeres White Lists</title>
+          </head>
+          <body>
+            <h2>🏳️ MeowMeres White Lists</h2>
+            <a href="white-list.txt">white-list.txt</a>
+          </body>
+          </html>
+          EOF
+
+      # =========================
+      # UPLOAD
+      # =========================
       - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v4
         with:
