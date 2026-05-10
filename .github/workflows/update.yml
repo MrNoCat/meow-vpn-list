@@ -129,7 +129,7 @@ jobs:
             echo ""
 
             cat out.txt
-          } > public/vpn.txt
+          } > public//white-list.txt
 
           cp out.txt public/android.txt
 
