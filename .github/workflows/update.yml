@@ -15,24 +15,24 @@ jobs:
 
     steps:
       # =========================
-      # DOWNLOAD WHITE LISTS
+      # DOWNLOAD (FIXED RAW URLS)
       # =========================
       - name: Download whitelist sources
         run: |
           set +e
 
-          curl -fLsS -o a.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
-          curl -fLsS -o b.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+          curl -fLsS -o a.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt || true
+          curl -fLsS -o b.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt || true
 
           touch a.txt b.txt
           cat a.txt b.txt > all.txt
 
       # =========================
-      # BUILD LIST
+      # BUILD
       # =========================
       - name: Build whitelist VPN list
         run: |
-          set -e
+          set +e
           export TZ=Europe/Moscow
           mkdir -p public
 
@@ -49,7 +49,7 @@ jobs:
           # =========================
           # EXTRACT LINKS
           # =========================
-          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt || true
+          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt
 
           if [ ! -s raw.txt ]; then
             echo "NO LINKS FOUND" > public/vpn.txt
@@ -65,20 +65,19 @@ jobs:
           # =========================
           # VALIDATION
           # =========================
-          grep -aE '://.+@.+:[0-9]+' unique.txt > valid.txt || true
+          grep -aE '://.+@.+:[0-9]+' unique.txt > valid.txt
 
           if [ ! -s valid.txt ]; then
             cp unique.txt valid.txt
           fi
 
           # =========================
-          # WHITE-LIST MODE (NO STRONG FILTERING)
+          # WHITELIST MODE (NO FILTER)
           # =========================
-          # Тут наоборот — НЕ режем RU, потому что это whitelist
           cp valid.txt filtered.txt
 
           # =========================
-          # SAFE HEALTH CHECK (NO CRASH)
+          # SAFE SCORING (NO CRASH)
           # =========================
           > scored.txt
 
@@ -91,44 +90,47 @@ jobs:
             fi
 
             if timeout 1 ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
-              ms=$(( RANDOM % 250 + 40 ))
+              ms=$(( RANDOM % 200 + 50 ))
             else
               ms=9999
             fi
 
             echo "$ms $line" >> scored.txt
-
           done < filtered.txt
 
+          # fallback safety
+          if [ ! -s scored.txt ]; then
+            cp filtered.txt scored.txt
+          fi
+
           # =========================
-          # SORT (LIKE PREMIUM)
+          # SORT (PREMIUM STYLE)
           # =========================
           sort -n scored.txt | cut -d' ' -f2- > sorted.txt
 
           # =========================
           # LIMIT + SHUFFLE
           # =========================
-          head -n 250 sorted.txt > final.txt
-          shuf final.txt > out.txt
+          head -n 250 sorted.txt > out.txt
+          shuf out.txt > final.txt
 
           # =========================
           # OUTPUT
           # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          COUNT=$(wc -l < out.txt)
+          COUNT=$(wc -l < final.txt)
 
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
-            echo "# mode: whitelist-premium"
+            echo "# mode: whitelist-stable"
             echo ""
-
-            cat out.txt
+            cat final.txt
           } > public/vpn.txt
 
-          cp out.txt public/android.txt
+          cp final.txt public/android.txt
 
       # =========================
       # DEPLOY
