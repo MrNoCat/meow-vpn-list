@@ -28,7 +28,7 @@ jobs:
           cat a.txt b.txt > all.txt
 
       # =========================
-      # BUILD
+      # BUILD (FAST MODE)
       # =========================
       - name: Build VPN list
         run: |
@@ -71,10 +71,13 @@ jobs:
             cp unique.txt valid.txt
           fi
 
-          cp valid.txt filtered.txt
+          # =========================
+          # FAST LIMIT (IMPORTANT!)
+          # =========================
+          head -n 120 valid.txt > filtered.txt
 
           # =========================
-          # REAL LATENCY CHECK (IMPROVED)
+          # LIGHTWEIGHT SCORING (NO HANG)
           # =========================
           > scored.txt
 
@@ -86,7 +89,8 @@ jobs:
               continue
             fi
 
-            ping_out=$(timeout 2 ping -c 1 -W 1 "$ip" 2>/dev/null | grep 'time=' | sed -n 's/.*time=\([0-9.]*\).*/\1/p')
+            # QUICK CHECK (NO LONG TIMEOUT)
+            ping_out=$(timeout 1 ping -c 1 -W 1 "$ip" 2>/dev/null | grep 'time=' | sed -n 's/.*time=\([0-9.]*\).*/\1/p')
 
             if [ -z "$ping_out" ]; then
               ms=9999
@@ -95,27 +99,28 @@ jobs:
             fi
 
             echo "$ms $line" >> scored.txt
-
           done < filtered.txt
 
-          # fallback safety
-          if [ ! -s scored.txt ]; then
-            cp filtered.txt scored.txt
-          fi
+          # fallback
+          [ -s scored.txt ] || cp filtered.txt scored.txt
 
           # =========================
-          # SORT BY LATENCY
+          # SORT (FAST)
           # =========================
           sort -n scored.txt | cut -d' ' -f2- > sorted.txt
 
           # =========================
-          # LIMIT + SHUFFLE
+          # OUTPUT LIMIT
           # =========================
-          head -n 200 sorted.txt > final.txt
+          head -n 100 sorted.txt > final.txt
+
+          # =========================
+          # FINAL SHUFFLE
+          # =========================
           shuf final.txt > out.txt
 
           # =========================
-          # OUTPUT (FIXED FILE NAME)
+          # OUTPUT FILES
           # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
@@ -125,6 +130,7 @@ jobs:
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
+            echo "# mode: fast-stable"
             echo ""
             cat out.txt
           } > public/white-list.txt
