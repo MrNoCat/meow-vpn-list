@@ -15,20 +15,20 @@ jobs:
 
     steps:
       # =========================
-      # DOWNLOAD (FIXED RAW URLS)
+      # DOWNLOAD SOURCES
       # =========================
       - name: Download whitelist sources
         run: |
           set +e
 
-          curl -fLsS -o a.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt || true
-          curl -fLsS -o b.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt || true
+          curl -fLsS -o a.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+          curl -fLsS -o b.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
           touch a.txt b.txt
           cat a.txt b.txt > all.txt
 
       # =========================
-      # BUILD
+      # BUILD (SAFE MODE)
       # =========================
       - name: Build whitelist VPN list
         run: |
@@ -50,11 +50,7 @@ jobs:
           # EXTRACT LINKS
           # =========================
           grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt
-
-          if [ ! -s raw.txt ]; then
-            echo "NO LINKS FOUND" > public/vpn.txt
-            exit 0
-          fi
+          [ -s raw.txt ] || { echo "NO LINKS FOUND" > public/vpn.txt; exit 0; }
 
           # =========================
           # CLEAN + DEDUP
@@ -66,18 +62,12 @@ jobs:
           # VALIDATION
           # =========================
           grep -aE '://.+@.+:[0-9]+' unique.txt > valid.txt
+          [ -s valid.txt ] || cp unique.txt valid.txt
 
-          if [ ! -s valid.txt ]; then
-            cp unique.txt valid.txt
-          fi
-
-          # =========================
-          # WHITELIST MODE (NO FILTER)
-          # =========================
           cp valid.txt filtered.txt
 
           # =========================
-          # SAFE SCORING (NO CRASH)
+          # SAFE SCORING (NO CRASH ZONE)
           # =========================
           > scored.txt
 
@@ -99,12 +89,10 @@ jobs:
           done < filtered.txt
 
           # fallback safety
-          if [ ! -s scored.txt ]; then
-            cp filtered.txt scored.txt
-          fi
+          [ -s scored.txt ] || cp filtered.txt scored.txt
 
           # =========================
-          # SORT (PREMIUM STYLE)
+          # SORT LIKE PREMIUM VPN
           # =========================
           sort -n scored.txt | cut -d' ' -f2- > sorted.txt
 
@@ -115,7 +103,7 @@ jobs:
           shuf out.txt > final.txt
 
           # =========================
-          # OUTPUT
+          # OUTPUT FILE
           # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
