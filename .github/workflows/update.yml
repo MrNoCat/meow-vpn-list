@@ -53,7 +53,6 @@ jobs:
               echo "9999 $line" >> scored.txt
               continue
             fi
-            # SAFE CHECK (no /dev/tcp, no crash)
             if timeout 1 ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
               ms=$(( RANDOM % 300 + 50 ))
             else
