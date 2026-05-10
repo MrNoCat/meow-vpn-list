@@ -15,9 +15,9 @@ jobs:
 
     steps:
       # =========================
-      # DOWNLOAD SOURCES
+      # DOWNLOAD
       # =========================
-      - name: Download whitelist sources
+      - name: Download sources
         run: |
           set +e
 
@@ -28,11 +28,11 @@ jobs:
           cat a.txt b.txt > all.txt
 
       # =========================
-      # BUILD (SAFE MODE)
+      # BUILD
       # =========================
-      - name: Build whitelist VPN list
+      - name: Build VPN list
         run: |
-          set +e
+          set -e
           export TZ=Europe/Moscow
           mkdir -p public
 
@@ -49,8 +49,12 @@ jobs:
           # =========================
           # EXTRACT LINKS
           # =========================
-          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt
-          [ -s raw.txt ] || { echo "NO LINKS FOUND" > public/vpn.txt; exit 0; }
+          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt || true
+
+          if [ ! -s raw.txt ]; then
+            echo "NO LINKS FOUND" > public/vpn.txt
+            exit 0
+          fi
 
           # =========================
           # CLEAN + DEDUP
@@ -61,13 +65,23 @@ jobs:
           # =========================
           # VALIDATION
           # =========================
-          grep -aE '://.+@.+:[0-9]+' unique.txt > valid.txt
-          [ -s valid.txt ] || cp unique.txt valid.txt
+          grep -aE '://.+@.+:[0-9]+' unique.txt > valid.txt || true
 
-          cp valid.txt filtered.txt
+          if [ ! -s valid.txt ]; then
+            cp unique.txt valid.txt
+          fi
 
           # =========================
-          # SAFE SCORING (NO CRASH ZONE)
+          # FILTER BAD TAGS ONLY
+          # =========================
+          grep -aviE '#.*(russia|anycast)' valid.txt > filtered.txt || true
+
+          if [ ! -s filtered.txt ]; then
+            cp valid.txt filtered.txt
+          fi
+
+          # =========================
+          # SAFE "PREMIUM" HEALTH CHECK (NO CRASH)
           # =========================
           > scored.txt
 
@@ -79,17 +93,16 @@ jobs:
               continue
             fi
 
+            # SAFE CHECK (no /dev/tcp, no crash)
             if timeout 1 ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
-              ms=$(( RANDOM % 200 + 50 ))
+              ms=$(( RANDOM % 300 + 50 ))
             else
               ms=9999
             fi
 
             echo "$ms $line" >> scored.txt
-          done < filtered.txt
 
-          # fallback safety
-          [ -s scored.txt ] || cp filtered.txt scored.txt
+          done < filtered.txt
 
           # =========================
           # SORT LIKE PREMIUM VPN
@@ -99,26 +112,26 @@ jobs:
           # =========================
           # LIMIT + SHUFFLE
           # =========================
-          head -n 250 sorted.txt > out.txt
-          shuf out.txt > final.txt
+          head -n 200 sorted.txt > final.txt
+          shuf final.txt > out.txt
 
           # =========================
-          # OUTPUT FILE
+          # OUTPUT
           # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          COUNT=$(wc -l < final.txt)
+          COUNT=$(wc -l < out.txt)
 
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
-            echo "# mode: whitelist-stable"
             echo ""
-            cat final.txt
+
+            cat out.txt
           } > public/vpn.txt
 
-          cp final.txt public/android.txt
+          cp out.txt public/android.txt
 
       # =========================
       # DEPLOY
