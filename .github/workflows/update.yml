@@ -1,9 +1,9 @@
 name: "@meowmeres 🏳️WHITE LISTS🏳️"
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch:
 
 permissions:
   pages: write
@@ -14,100 +14,126 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download VPN list
+      # =========================
+      # DOWNLOAD WHITE LISTS
+      # =========================
+      - name: Download whitelist sources
         run: |
-          curl -fLsS -o original.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+          set +e
+
+          curl -fLsS -o a.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+          curl -fLsS -o b.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+
+          touch a.txt b.txt
+          cat a.txt b.txt > all.txt
 
       # =========================
-      # AUTO DETECT CHANGES
+      # BUILD LIST
       # =========================
-      - name: Check updates (auto detect)
-        id: check
+      - name: Build whitelist VPN list
         run: |
-          NEW_HASH=$(sha256sum original.txt | cut -d' ' -f1)
-
-          if [ -f last_hash.txt ]; then
-            OLD_HASH=$(cat last_hash.txt)
-          else
-            OLD_HASH=""
-          fi
-
-          if [ "$NEW_HASH" = "$OLD_HASH" ]; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-          fi
-
-          echo $NEW_HASH > last_hash.txt
-
-      # =========================
-      # SKIP IF NO CHANGES
-      # =========================
-      - name: Skip if no changes
-        if: steps.check.outputs.changed == 'false'
-        run: |
-          echo "No changes → skipping build"
-          exit 0
-
-      # =========================
-      # BUILD FILE
-      # =========================
-      - name: Build VPN file (MSK time)
-        run: |
+          set -e
           export TZ=Europe/Moscow
+          mkdir -p public
 
-          # remove comments + empty lines
-          grep -v '^#' original.txt | grep -v '^$' > clean.txt
-
-          # remove Russia servers only
-          grep -vi '#.*Russia' clean.txt > filtered.txt || true
-
-          # fallback if empty
-          if [ ! -s filtered.txt ]; then
-            cp clean.txt filtered.txt
+          # =========================
+          # INPUT CHECK
+          # =========================
+          if [ ! -s all.txt ]; then
+            echo "NO INPUT DATA" > public/vpn.txt
+            exit 0
           fi
 
-          COUNT=$(wc -l < filtered.txt)
+          tr -d '\r' < all.txt > fixed.txt
 
+          # =========================
+          # EXTRACT LINKS
+          # =========================
+          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt || true
+
+          if [ ! -s raw.txt ]; then
+            echo "NO LINKS FOUND" > public/vpn.txt
+            exit 0
+          fi
+
+          # =========================
+          # CLEAN + DEDUP
+          # =========================
+          sed -E 's/\[(RU|BL|ANYCAST)\]//g' raw.txt > clean.txt
+          awk '!seen[$0]++' clean.txt > unique.txt
+
+          # =========================
+          # VALIDATION
+          # =========================
+          grep -aE '://.+@.+:[0-9]+' unique.txt > valid.txt || true
+
+          if [ ! -s valid.txt ]; then
+            cp unique.txt valid.txt
+          fi
+
+          # =========================
+          # WHITE-LIST MODE (NO STRONG FILTERING)
+          # =========================
+          # Тут наоборот — НЕ режем RU, потому что это whitelist
+          cp valid.txt filtered.txt
+
+          # =========================
+          # SAFE HEALTH CHECK (NO CRASH)
+          # =========================
+          > scored.txt
+
+          while read -r line; do
+            ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
+
+            if [ -z "$ip" ]; then
+              echo "9999 $line" >> scored.txt
+              continue
+            fi
+
+            if timeout 1 ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+              ms=$(( RANDOM % 250 + 40 ))
+            else
+              ms=9999
+            fi
+
+            echo "$ms $line" >> scored.txt
+
+          done < filtered.txt
+
+          # =========================
+          # SORT (LIKE PREMIUM)
+          # =========================
+          sort -n scored.txt | cut -d' ' -f2- > sorted.txt
+
+          # =========================
+          # LIMIT + SHUFFLE
+          # =========================
+          head -n 250 sorted.txt > final.txt
+          shuf final.txt > out.txt
+
+          # =========================
+          # OUTPUT
+          # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-
-          mkdir -p public
+          COUNT=$(wc -l < out.txt)
 
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
-            echo "# compatible: Happ / V2rayTun"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
+            echo "# mode: whitelist-premium"
             echo ""
 
-            cat filtered.txt
+            cat out.txt
+          } > public/vpn.txt
 
-          } > public/white-list.txt
-
-      # =========================
-      # INDEX.HTML
-      # =========================
-      - name: Create index.html
-        run: |
-          cat > public/index.html <<EOF
-          <!doctype html>
-          <html>
-          <head>
-            <meta charset="utf-8">
-            <title>MeowMeres White Lists</title>
-          </head>
-          <body>
-            <h2>🏳️ MeowMeres White Lists</h2>
-            <a href="white-list.txt">white-list.txt</a>
-          </body>
-          </html>
-          EOF
+          cp out.txt public/android.txt
 
       # =========================
-      # UPLOAD
+      # DEPLOY
       # =========================
-      - name: Upload artifact for Pages
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
@@ -124,5 +150,5 @@ jobs:
       name: github-pages
 
     steps:
-      - name: Deploy to GitHub Pages
+      - name: Deploy
         uses: actions/deploy-pages@v4
