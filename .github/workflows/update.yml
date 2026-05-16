@@ -5,25 +5,24 @@ on:
   schedule:
     - cron: "*/30 * * * *"
 
-concurrency:
-  group: white-lists-pages
-  cancel-in-progress: true
-
 permissions:
-  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+
     steps:
+      # =========================
+      # CHECKOUT
+      # =========================
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-
+      # =========================
+      # BUILD VPN LIST
+      # =========================
       - name: Build VPN list
         shell: bash
         run: |
@@ -32,120 +31,154 @@ jobs:
 
           mkdir -p public
           workdir="$(mktemp -d)"
-          trap 'rm -rf "$workdir"' EXIT
 
+          cleanup() {
+            rm -rf "$workdir"
+          }
+
+          trap cleanup EXIT
+
+          # =========================
+          # FILES
+          # =========================
           A="$workdir/a.txt"
           B="$workdir/b.txt"
           ALL="$workdir/all.txt"
           FIXED="$workdir/fixed.txt"
           RAW="$workdir/raw.txt"
           CLEAN="$workdir/clean.txt"
+          VALID="$workdir/valid.txt"
+          FILTERED="$workdir/filtered.txt"
           SCORED="$workdir/scored.txt"
           SORTED="$workdir/sorted.txt"
           FINAL="$workdir/final.txt"
 
-          download() {
-            local url="$1"
-            local out="$2"
-            curl -fsSL \
-              --retry 3 \
-              --retry-connrefused \
-              --connect-timeout 10 \
-              --max-time 60 \
-              "$url" -o "$out"
-          }
+          # =========================
+          # DOWNLOAD
+          # =========================
+          echo "[+] Downloading sources..."
 
-          download "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt" "$A"
-          download "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt" "$B"
+          curl -fsSL --retry 3 --connect-timeout 10 \
+            -o "$A" \
+            https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+
+          curl -fsSL --retry 3 --connect-timeout 10 \
+            -o "$B" \
+            https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
           cat "$A" "$B" > "$ALL"
 
-          if [[ ! -s "$ALL" ]]; then
-            cat > public/white-list.txt <<'EOF'
-# profile-title: @meowmeres 🏳️WHITE LISTS🏳️
-# update: NO DATA
-# servers: 0
-
-NO INPUT DATA
-EOF
-            cp public/white-list.txt public/android.txt
+          if [ ! -s "$ALL" ]; then
+            echo "NO INPUT DATA" > public/white-list.txt
             exit 0
           fi
 
+          # =========================
+          # FIX WINDOWS LINES
+          # =========================
           tr -d '\r' < "$ALL" > "$FIXED"
+
+          # =========================
+          # EXTRACT LINKS
+          # =========================
+          echo "[+] Extracting links..."
 
           grep -aEo '(vless|trojan|ss)://[^[:space:]]+' "$FIXED" > "$RAW" || true
 
-          if [[ ! -s "$RAW" ]]; then
-            cat > public/white-list.txt <<'EOF'
-# profile-title: @meowmeres 🏳️WHITE LISTS🏳️
-# update: NO LINKS
-# servers: 0
-
-NO LINKS FOUND
-EOF
-            cp public/white-list.txt public/android.txt
+          if [ ! -s "$RAW" ]; then
+            echo "NO LINKS FOUND" > public/white-list.txt
             exit 0
           fi
 
+          # =========================
+          # CLEAN TAGS + DEDUP
+          # =========================
+          echo "[+] Cleaning..."
+
           sed -E 's/\[(RU|BL|ANYCAST)\]//g' "$RAW" \
-            | sed -E 's/[[:space:]]+$//' \
-            | awk 'NF' \
-            | awk '!seen[$0]++' > "$CLEAN"
+            | sort -u > "$CLEAN"
+
+          # =========================
+          # BASIC VALIDATION
+          # =========================
+          echo "[+] Validating..."
+
+          grep -aE '://.+@.+:[0-9]+' "$CLEAN" > "$VALID" || true
+
+          if [ ! -s "$VALID" ]; then
+            cp "$CLEAN" "$VALID"
+          fi
+
+          # =========================
+          # FILTER BAD TAGS
+          # =========================
+          grep -aviE '(russia|anycast)' "$VALID" > "$FILTERED" || true
+
+          if [ ! -s "$FILTERED" ]; then
+            cp "$VALID" "$FILTERED"
+          fi
+
+          # =========================
+          # SIMPLE HEALTH SCORE
+          # =========================
+          echo "[+] Checking servers..."
 
           > "$SCORED"
 
-          while IFS= read -r line; do
-            if [[ ! "$line" =~ ^(vless|trojan|ss)://[^[:space:]]+$ ]]; then
+          while read -r line; do
+
+            host=$(echo "$line" \
+              | sed -nE 's#.*@([^:/?]+).*#\1#p' \
+              | head -n 1)
+
+            if [ -z "$host" ]; then
+              echo "9999|$line" >> "$SCORED"
               continue
             fi
 
-            if [[ "$line" =~ @(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5}) ]]; then
-              host="${BASH_REMATCH[1]}"
-              port="${BASH_REMATCH[2]}"
-              probe_host="${host#[}"
-              probe_host="${probe_host%]}"
-
-              if [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
-                echo "9999|$line" >> "$SCORED"
-                continue
-              fi
-
-              if [[ "$probe_host" =~ : ]]; then
-                score=1
-              elif timeout 3 bash -c "cat < /dev/null > /dev/tcp/${probe_host}/${port}" >/dev/null 2>&1; then
-                score=1
-              else
-                score=9999
-              fi
+            if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
+              score=1
             else
               score=9999
             fi
 
             echo "$score|$line" >> "$SCORED"
-          done < "$CLEAN"
 
-          sort -s -n "$SCORED" \
+          done < "$FILTERED"
+
+          # =========================
+          # SORT + LIMIT
+          # =========================
+          sort -n "$SCORED" \
             | cut -d'|' -f2- \
             | awk '!seen[$0]++' \
             | head -n 200 > "$SORTED"
 
           cp "$SORTED" "$FINAL"
 
-          DATE="$(date +'%d.%m.%Y')"
-          TIME="$(date +'%H:%M')"
-          COUNT="$(wc -l < "$FINAL" | tr -d ' ')"
+          # =========================
+          # OUTPUT
+          # =========================
+          DATE=$(date +"%d.%m.%Y")
+          TIME=$(date +"%H:%M")
+          COUNT=$(wc -l < "$FINAL")
 
           {
-            printf '# profile-title: @meowmeres 🏳️WHITE LISTS🏳️\n'
-            printf '# update: %s %s (MSK)\n' "$DATE" "$TIME"
-            printf '# servers: %s\n\n' "$COUNT"
+            echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
+            echo "# update: $DATE $TIME (MSK)"
+            echo "# servers: $COUNT"
+            echo ""
             cat "$FINAL"
           } > public/white-list.txt
 
           cp "$FINAL" public/android.txt
 
-      - name: Upload GitHub Pages artifact
+          echo "[+] Done. Total servers: $COUNT"
+
+      # =========================
+      # UPLOAD ARTIFACT
+      # =========================
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
@@ -153,13 +186,15 @@ EOF
   deploy:
     needs: build
     runs-on: ubuntu-latest
+
     permissions:
-      contents: read
       pages: write
       id-token: write
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
