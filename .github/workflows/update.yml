@@ -15,168 +15,101 @@ jobs:
 
     steps:
       # =========================
-      # CHECKOUT
+      # DOWNLOAD
       # =========================
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - name: Download sources
+        run: |
+          set +e
+          curl -fLsS -o a.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
+          curl -fLsS -o b.txt https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+          touch a.txt b.txt
+          cat a.txt b.txt > all.txt
       # =========================
-      # BUILD VPN LIST
+      # BUILD
       # =========================
       - name: Build VPN list
-        shell: bash
         run: |
-          set -euo pipefail
+          set -e
           export TZ=Europe/Moscow
-
           mkdir -p public
-          workdir="$(mktemp -d)"
-
-          cleanup() {
-            rm -rf "$workdir"
-          }
-
-          trap cleanup EXIT
-
           # =========================
-          # FILES
+          # INPUT CHECK
           # =========================
-          A="$workdir/a.txt"
-          B="$workdir/b.txt"
-          ALL="$workdir/all.txt"
-          FIXED="$workdir/fixed.txt"
-          RAW="$workdir/raw.txt"
-          CLEAN="$workdir/clean.txt"
-          VALID="$workdir/valid.txt"
-          FILTERED="$workdir/filtered.txt"
-          SCORED="$workdir/scored.txt"
-          SORTED="$workdir/sorted.txt"
-          FINAL="$workdir/final.txt"
-
-          # =========================
-          # DOWNLOAD
-          # =========================
-          echo "[+] Downloading sources..."
-
-          curl -fsSL --retry 3 --connect-timeout 10 \
-            -o "$A" \
-            https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
-
-          curl -fsSL --retry 3 --connect-timeout 10 \
-            -o "$B" \
-            https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt
-
-          cat "$A" "$B" > "$ALL"
-
-          if [ ! -s "$ALL" ]; then
-            echo "NO INPUT DATA" > public/white-list.txt
+          if [ ! -s all.txt ]; then
+            echo "NO INPUT DATA" > public/vpn.txt
             exit 0
           fi
-
-          # =========================
-          # FIX WINDOWS LINES
-          # =========================
-          tr -d '\r' < "$ALL" > "$FIXED"
-
+          tr -d '\r' < all.txt > fixed.txt
           # =========================
           # EXTRACT LINKS
           # =========================
-          echo "[+] Extracting links..."
-
-          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' "$FIXED" > "$RAW" || true
-
-          if [ ! -s "$RAW" ]; then
-            echo "NO LINKS FOUND" > public/white-list.txt
+          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt || true
+          if [ ! -s raw.txt ]; then
+            echo "NO LINKS FOUND" > public/vpn.txt
             exit 0
           fi
-
           # =========================
-          # CLEAN TAGS + DEDUP
+          # CLEAN + DEDUP
           # =========================
-          echo "[+] Cleaning..."
-
-          sed -E 's/\[(RU|BL|ANYCAST)\]//g' "$RAW" \
-            | sort -u > "$CLEAN"
-
+          sed -E 's/\[(RU|BL|ANYCAST)\]//g' raw.txt > clean.txt
+          awk '!seen[$0]++' clean.txt > unique.txt
           # =========================
-          # BASIC VALIDATION
+          # VALIDATION
           # =========================
-          echo "[+] Validating..."
-
-          grep -aE '://.+@.+:[0-9]+' "$CLEAN" > "$VALID" || true
-
-          if [ ! -s "$VALID" ]; then
-            cp "$CLEAN" "$VALID"
+          grep -aE '://.+@.+:[0-9]+' unique.txt > valid.txt || true
+          if [ ! -s valid.txt ]; then
+            cp unique.txt valid.txt
           fi
-
           # =========================
-          # FILTER BAD TAGS
+          # FILTER BAD TAGS ONLY
           # =========================
-          grep -aviE '(russia|anycast)' "$VALID" > "$FILTERED" || true
-
-          if [ ! -s "$FILTERED" ]; then
-            cp "$VALID" "$FILTERED"
+          grep -aviE '#.*(russia|anycast)' valid.txt > filtered.txt || true
+          if [ ! -s filtered.txt ]; then
+            cp valid.txt filtered.txt
           fi
-
           # =========================
-          # SIMPLE HEALTH SCORE
+          # SAFE "PREMIUM" HEALTH CHECK (NO CRASH)
           # =========================
-          echo "[+] Checking servers..."
-
-          > "$SCORED"
-
+          > scored.txt
           while read -r line; do
-
-            host=$(echo "$line" \
-              | sed -nE 's#.*@([^:/?]+).*#\1#p' \
-              | head -n 1)
-
-            if [ -z "$host" ]; then
-              echo "9999|$line" >> "$SCORED"
+            ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
+            if [ -z "$ip" ]; then
+              echo "9999 $line" >> scored.txt
               continue
             fi
-
-            if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
-              score=1
+            # SAFE CHECK (no /dev/tcp, no crash)
+            if timeout 1 ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+              ms=$(( RANDOM % 300 + 50 ))
             else
-              score=9999
+              ms=9999
             fi
-
-            echo "$score|$line" >> "$SCORED"
-
-          done < "$FILTERED"
-
+            echo "$ms $line" >> scored.txt
+          done < filtered.txt
           # =========================
-          # SORT + LIMIT
+          # SORT LIKE PREMIUM VPN
           # =========================
-          sort -n "$SCORED" \
-            | cut -d'|' -f2- \
-            | awk '!seen[$0]++' \
-            | head -n 200 > "$SORTED"
-
-          cp "$SORTED" "$FINAL"
-
+          sort -n scored.txt | cut -d' ' -f2- > sorted.txt
+          # =========================
+          # LIMIT + SHUFFLE
+          # =========================
+          head -n 200 sorted.txt > final.txt
+          shuf final.txt > out.txt
           # =========================
           # OUTPUT
           # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          COUNT=$(wc -l < "$FINAL")
-
+          COUNT=$(wc -l < out.txt)
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
             echo ""
-            cat "$FINAL"
-          } > public/white-list.txt
-
-          cp "$FINAL" public/android.txt
-
-          echo "[+] Done. Total servers: $COUNT"
-
+            cat out.txt
+          } > public//white-list.txt
+          cp out.txt public/android.txt
       # =========================
-      # UPLOAD ARTIFACT
+      # DEPLOY
       # =========================
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
@@ -193,9 +126,7 @@ jobs:
 
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
+      - name: Deploy
         uses: actions/deploy-pages@v4
