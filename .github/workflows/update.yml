@@ -15,20 +15,38 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # =========================
-      # DOWNLOAD
-      # =========================
       - name: Download config
         run: |
           set -e
-
           curl -fLsS \
-          	https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt \
-          -o all.txt
+            https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt \
+            -o all.txt
 
-      # =========================
-      # BUILD
-      # =========================
+      - name: Get traffic stats (optional)
+        run: |
+          set -e
+
+          API_URL="${{ secrets.API_URL }}"
+          API_KEY="${{ secrets.API_KEY }}"
+
+          if [ -z "$API_URL" ]; then
+            echo "UPLOAD=0" >> $GITHUB_ENV
+            echo "DOWNLOAD=0" >> $GITHUB_ENV
+            echo "TOTAL=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL")
+
+          UPLOAD=$(echo "$RESPONSE" | jq '.upload // 0')
+          DOWNLOAD=$(echo "$RESPONSE" | jq '.download // 0')
+
+          TOTAL=$((UPLOAD + DOWNLOAD))
+
+          echo "UPLOAD=$UPLOAD" >> $GITHUB_ENV
+          echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+
       - name: Build list
         run: |
           set -e
@@ -36,7 +54,6 @@ jobs:
 
           mkdir -p public
 
-          # check file
           if [ ! -s all.txt ]; then
             echo "NO DATA" > public/white-list.txt
             exit 0
@@ -44,7 +61,6 @@ jobs:
 
           tr -d '\r' < all.txt > fixed.txt
 
-          # extract vpn links
           grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > links.txt || true
 
           if [ ! -s links.txt ]; then
@@ -52,16 +68,21 @@ jobs:
             exit 0
           fi
 
-          # deduplicate
           awk '!seen[$0]++' links.txt > final.txt
 
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
+
           COUNT=$(wc -l < final.txt)
 
-          # final file (IMPORTANT)
+          UPLOAD=${UPLOAD:-0}
+          DOWNLOAD=${DOWNLOAD:-0}
+          TOTAL=${TOTAL:-0}
+
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
+            echo "# profile-update-interval: 1"
+            echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
             echo ""
@@ -70,12 +91,8 @@ jobs:
 
           cp final.txt public/android.txt
 
-          # IMPORTANT: add index for GitHub Pages visibility
           echo "OK" > public/index.html
 
-      # =========================
-      # PAGES ARTIFACT
-      # =========================
       - name: Setup Pages
         uses: actions/configure-pages@v4
 
@@ -97,5 +114,4 @@ jobs:
 
     steps:
       - name: Deploy
-        id: deployment
         uses: actions/deploy-pages@v4
