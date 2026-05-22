@@ -8,6 +8,7 @@ on:
 permissions:
   pages: write
   id-token: write
+  contents: read
 
 jobs:
   build:
@@ -17,7 +18,7 @@ jobs:
       # =========================
       # DOWNLOAD
       # =========================
-      - name: Download sources
+      - name: Download config
         run: |
           set -e
 
@@ -28,49 +29,37 @@ jobs:
       # =========================
       # BUILD
       # =========================
-      - name: Build VPN list
+      - name: Build list
         run: |
           set -e
           export TZ=Europe/Moscow
 
           mkdir -p public
 
-          # =========================
-          # INPUT CHECK
-          # =========================
+          # check file
           if [ ! -s all.txt ]; then
-            echo "NO INPUT DATA" > public/white-list.txt
+            echo "NO DATA" > public/white-list.txt
             exit 0
           fi
 
-          # FIX WINDOWS LINES
           tr -d '\r' < all.txt > fixed.txt
 
-          # =========================
-          # EXTRACT VPN LINKS
-          # =========================
-          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt || true
+          # extract vpn links
+          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > links.txt || true
 
-          if [ ! -s raw.txt ]; then
+          if [ ! -s links.txt ]; then
             echo "NO LINKS FOUND" > public/white-list.txt
             exit 0
           fi
 
-          # =========================
-          # REMOVE DUPLICATES
-          # =========================
-          awk '!seen[$0]++' raw.txt > final.txt
+          # deduplicate
+          awk '!seen[$0]++' links.txt > final.txt
 
-          # =========================
-          # INFO
-          # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
           COUNT=$(wc -l < final.txt)
 
-          # =========================
-          # OUTPUT
-          # =========================
+          # final file (IMPORTANT)
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# update: $DATE $TIME (MSK)"
@@ -81,10 +70,16 @@ jobs:
 
           cp final.txt public/android.txt
 
+          # IMPORTANT: add index for GitHub Pages visibility
+          echo "OK" > public/index.html
+
       # =========================
-      # UPLOAD
+      # PAGES ARTIFACT
       # =========================
-      - name: Upload Pages artifact
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
@@ -99,7 +94,6 @@ jobs:
 
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Deploy
