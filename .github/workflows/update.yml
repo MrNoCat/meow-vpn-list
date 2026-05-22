@@ -43,10 +43,11 @@ jobs:
             exit 0
           fi
 
+          # FIX WINDOWS LINES
           tr -d '\r' < all.txt > fixed.txt
 
           # =========================
-          # EXTRACT LINKS
+          # EXTRACT VPN LINKS
           # =========================
           grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > raw.txt || true
 
@@ -56,17 +57,20 @@ jobs:
           fi
 
           # =========================
-          # SIMPLE DEDUP
+          # REMOVE DUPLICATES
           # =========================
           awk '!seen[$0]++' raw.txt > final.txt
 
           # =========================
-          # OUTPUT
+          # INFO
           # =========================
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
           COUNT=$(wc -l < final.txt)
 
+          # =========================
+          # OUTPUT
+          # =========================
           {
             echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# update: $DATE $TIME (MSK)"
@@ -78,7 +82,7 @@ jobs:
           cp final.txt public/android.txt
 
       # =========================
-      # DEPLOY
+      # UPLOAD
       # =========================
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
@@ -95,7 +99,9 @@ jobs:
 
     environment:
       name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Deploy
+        id: deployment
         uses: actions/deploy-pages@v4
