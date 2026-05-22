@@ -23,7 +23,7 @@ jobs:
           set -e
 
           curl -fLsS \
-          https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt \
+          	https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt \
           -o all.txt
 
       # =========================
