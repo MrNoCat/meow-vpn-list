@@ -3,7 +3,7 @@ name: "@meowmeres 🏳️WHITE LISTS🏳️"
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 */12 * * *"
 
 permissions:
   pages: write
@@ -15,81 +15,63 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download config
+      - name: Download configs
         run: |
           set -e
-          curl -fLsS \
-            https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt \
-            -o all.txt
+          mkdir -p public
+          curl -fLsS https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt -o all.txt || echo "" > all.txt
 
-      - name: Get traffic stats (optional)
-        run: |
-          set -e
-
-          API_URL="${{ secrets.API_URL }}"
-          API_KEY="${{ secrets.API_KEY }}"
-
-          if [ -z "$API_URL" ]; then
-            echo "UPLOAD=0" >> $GITHUB_ENV
-            echo "DOWNLOAD=0" >> $GITHUB_ENV
-            echo "TOTAL=0" >> $GITHUB_ENV
-            exit 0
-          fi
-
-          RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL")
-
-          UPLOAD=$(echo "$RESPONSE" | jq '.upload // 0')
-          DOWNLOAD=$(echo "$RESPONSE" | jq '.download // 0')
-
-          TOTAL=$((UPLOAD + DOWNLOAD))
-
-          echo "UPLOAD=$UPLOAD" >> $GITHUB_ENV
-          echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-
-      - name: Build list
+      - name: Build fast servers list
         run: |
           set -e
           export TZ=Europe/Moscow
 
-          mkdir -p public
+          LOCATIONS="Frankfurt Finland Italy Netherlands"
+          PROTOCOLS="tcp xhttp grpc"
 
-          if [ ! -s all.txt ]; then
-            echo "NO DATA" > public/white-list.txt
-            exit 0
-          fi
+          for LOC in $LOCATIONS; do
+            for PROTO in $PROTOCOLS; do
+              grep -i "$LOC" all.txt | grep -i "$PROTO" | head -n 1 > "${LOC}_${PROTO}.tmp" || echo "" > "${LOC}_${PROTO}.tmp"
+            done
+          done
 
-          tr -d '\r' < all.txt > fixed.txt
-
-          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > links.txt || true
-
-          if [ ! -s links.txt ]; then
-            echo "NO LINKS FOUND" > public/white-list.txt
-            exit 0
-          fi
-
-          awk '!seen[$0]++' links.txt > final.txt
+          # Берём первые попавшиеся для каждого протокола (по приоритету локаций)
+          TCP=$(cat Frankfurt_tcp.tmp Finland_tcp.tmp Italy_tcp.tmp Netherlands_tcp.tmp 2>/dev/null | head -n 1 | tr -d '\r' | grep -aEo 'vless://[^[:space:]]+' || echo "")
+          XHTTP=$(cat Frankfurt_xhttp.tmp Finland_xhttp.tmp Italy_xhttp.tmp Netherlands_xhttp.tmp 2>/dev/null | head -n 1 | tr -d '\r' | grep -aEo 'vless://[^[:space:]]+' || echo "")
+          GRPC=$(cat Frankfurt_grpc.tmp Finland_grpc.tmp Italy_grpc.tmp Netherlands_grpc.tmp 2>/dev/null | head -n 1 | tr -d '\r' | grep -aEo 'vless://[^[:space:]]+' || echo "")
 
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
 
-          COUNT=$(wc -l < final.txt)
-
-          UPLOAD=${UPLOAD:-0}
-          DOWNLOAD=${DOWNLOAD:-0}
-          TOTAL=${TOTAL:-0}
+          {
+            echo "# profile-title: 🚀 MeowMere VPN TCP"
+            echo "# profile-update-interval: 12"
+            echo "# subscription-userinfo: upload=0; download=0; total=0; expire=0"
+            echo "# update: $DATE $TIME (MSK)"
+            echo "# servers: 1"
+            echo ""
+            echo "$TCP"
+          } > public/tcp.txt
 
           {
-            echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
-            echo "# profile-update-interval: 1"
-            echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
+            echo "# profile-title: 🚀 MeowMere VPN XHTTP"
+            echo "# profile-update-interval: 12"
+            echo "# subscription-userinfo: upload=0; download=0; total=0; expire=0"
             echo "# update: $DATE $TIME (MSK)"
-            echo "# servers: $COUNT"
+            echo "# servers: 1"
             echo ""
-            cat final.txt
-          } > public/white-list.txt
+            echo "$XHTTP"
+          } > public/xhttp.txt
 
-          cp final.txt public/android.txt
+          {
+            echo "# profile-title: 🚀 MeowMere VPN gRPC"
+            echo "# profile-update-interval: 12"
+            echo "# subscription-userinfo: upload=0; download=0; total=0; expire=0"
+            echo "# update: $DATE $TIME (MSK)"
+            echo "# servers: 1"
+            echo ""
+            echo "$GRPC"
+          } > public/grpc.txt
 
           echo "OK" > public/index.html
 
@@ -104,14 +86,11 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-
     permissions:
       pages: write
       id-token: write
-
     environment:
       name: github-pages
-
     steps:
       - name: Deploy
         uses: actions/deploy-pages@v4
