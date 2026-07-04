@@ -42,7 +42,7 @@ jobs:
           echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-      - name: Build list
+      - name: Build list with geo filtering
         run: |
           set -e
           export TZ=Europe/Moscow
@@ -55,6 +55,7 @@ jobs:
             exit 0
           fi
           
+          # Extract links
           tr -d '\r' < all.txt | grep -aEo '(vless|trojan|ss)://[^[:space:]]+' > links.txt || true
           
           if [ ! -s links.txt ]; then
@@ -64,16 +65,71 @@ jobs:
             exit 0
           fi
           
+          # Remove duplicates
           awk '!seen[$0]++' links.txt > unique.txt
-          head -5 unique.txt > final.txt
           
+          # Create separate lists for Russia and other countries
+          > russia_servers.txt
+          > other_servers.txt
+          
+          # Process each server and detect country by IP
+          while IFS= read -r link; do
+            # Extract host from link
+            if [[ $link =~ vless://([^@]+)@([^:]+):([0-9]+) ]]; then
+              HOST="${BASH_REMATCH[2]}"
+            else
+              HOST=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f1)
+            fi
+            
+            # Get country using ip-api.com (fast, free, no API key needed)
+            COUNTRY=$(curl -s --max-time 2 "http://ip-api.com/line/$HOST?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
+            
+            # Check if Russia
+            if [[ "$COUNTRY" == "RU" ]]; then
+              echo "$link" >> russia_servers.txt
+            else
+              echo "$link" >> other_servers.txt
+            fi
+          done < unique.txt
+          
+          # Take 3 from Russia and 2 from other countries
+          > selected.txt
+          head -3 russia_servers.txt >> selected.txt
+          head -2 other_servers.txt >> selected.txt
+          
+          # If not enough Russia servers, take more from other countries
+          RUSSIA_COUNT=$(wc -l < russia_servers.txt)
+          OTHER_COUNT=$(wc -l < other_servers.txt)
+          
+          if [ "$RUSSIA_COUNT" -lt 3 ]; then
+            # Need more from other countries
+            NEEDED=$((5 - RUSSIA_COUNT))
+            if [ "$OTHER_COUNT" -ge "$NEEDED" ]; then
+              head -$NEEDED other_servers.txt > temp.txt
+              cat russia_servers.txt > selected.txt
+              cat temp.txt >> selected.txt
+            else
+              cat russia_servers.txt > selected.txt
+              head -$((5 - RUSSIA_COUNT)) other_servers.txt >> selected.txt
+            fi
+          fi
+          
+          # If no servers at all, use first 5 from unique
+          if [ ! -s selected.txt ]; then
+            head -5 unique.txt > selected.txt
+          fi
+          
+          # Remove empty lines
+          sed -i '/^$/d' selected.txt
+          
+          # Add names
           COUNT=1
           > final_with_names.txt
           while IFS= read -r link; do
             echo "📱LTE Обход #$COUNT" >> final_with_names.txt
             echo "$link" >> final_with_names.txt
             ((COUNT++))
-          done < final.txt
+          done < selected.txt
           
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
@@ -92,14 +148,14 @@ jobs:
             cat final_with_names.txt
           } > public/white-list.txt
           
-          cat final.txt > public/android.txt
+          cat selected.txt > public/android.txt
           echo "✅ Updated: $DATE $TIME" > public/index.html
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5  # Обновлено до v5
+        uses: actions/configure-pages@v5
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3  # Обновлено до v3
+        uses: actions/upload-pages-artifact@v3
         with:
           path: public
 
@@ -117,4 +173,4 @@ jobs:
 
     steps:
       - name: Deploy to GitHub Pages
-        uses: actions/deploy-pages@v4  # Оставляем v4, она совместима с Node 24
+        uses: actions/deploy-pages@v4
