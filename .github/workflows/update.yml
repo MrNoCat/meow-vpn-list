@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 3  # Лимит времени выполнения
+    timeout-minutes: 3
 
     steps:
       - name: Download config
@@ -42,13 +42,12 @@ jobs:
           echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-      - name: Fast build list (no speed test)
+      - name: Build list
         run: |
           set -e
           export TZ=Europe/Moscow
           mkdir -p public
           
-          # Если файл пустой или нет данных
           if [ ! -s all.txt ]; then
             echo "NO DATA" > public/white-list.txt
             echo "NO DATA" > public/android.txt
@@ -56,10 +55,8 @@ jobs:
             exit 0
           fi
           
-          # Быстрая очистка и извлечение ссылок
           tr -d '\r' < all.txt | grep -aEo '(vless|trojan|ss)://[^[:space:]]+' > links.txt || true
           
-          # Если нет ссылок
           if [ ! -s links.txt ]; then
             echo "NO LINKS FOUND" > public/white-list.txt
             echo "NO LINKS FOUND" > public/android.txt
@@ -67,13 +64,9 @@ jobs:
             exit 0
           fi
           
-          # Удаление дубликатов (быстро)
           awk '!seen[$0]++' links.txt > unique.txt
-          
-          # Просто берем первые 5 ссылок (без проверки скорости)
           head -5 unique.txt > final.txt
           
-          # Формируем вывод с именами
           COUNT=1
           > final_with_names.txt
           while IFS= read -r link; do
@@ -99,16 +92,14 @@ jobs:
             cat final_with_names.txt
           } > public/white-list.txt
           
-          # Только ссылки для android
           cat final.txt > public/android.txt
-          
           echo "✅ Updated: $DATE $TIME" > public/index.html
 
       - name: Setup Pages
-        uses: actions/configure-pages@v4
+        uses: actions/configure-pages@v5  # Обновлено до v5
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v3  # Обновлено до v3
         with:
           path: public
 
@@ -125,5 +116,5 @@ jobs:
       name: github-pages
 
     steps:
-      - name: Deploy
-        uses: actions/deploy-pages@v4
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4  # Оставляем v4, она совместима с Node 24
