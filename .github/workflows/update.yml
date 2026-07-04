@@ -56,31 +56,45 @@ jobs:
           fi
           
           tr -d '\r' < all.txt > fixed.txt
-          grep -aEo 'hysteria://[^[:space:]]+' fixed.txt > links.txt || true
           
-          if [ ! -s links.txt ]; then
-            echo "NO HYSTERIA LINKS" > public/white-list.txt
+          # Сначала вытаскиваем hysteria (приоритет)
+          grep -aEo 'hysteria://[^[:space:]]+' fixed.txt > hysteria_links.txt || true
+          
+          # Потом vless и trojan (запасные)
+          grep -aEo '(vless|trojan)://[^[:space:]]+' fixed.txt > other_links.txt || true
+          
+          # Объединяем: сначала hysteria, потом остальные
+          cat hysteria_links.txt other_links.txt > all_links.txt
+          
+          if [ ! -s all_links.txt ]; then
+            echo "NO LINKS" > public/white-list.txt
             exit 0
           fi
           
-          awk '!seen[$0]++' links.txt > unique.txt
+          awk '!seen[$0]++' all_links.txt > unique.txt
           
-          # Тестируем скорость каждого сервера (ping)
+          # Тестируем скорость каждого сервера
           > speed_results.txt
           while IFS= read -r line; do
-            # Извлекаем хост из ссылки hysteria://host:port
-            HOST=$(echo "$line" | sed -E 's|hysteria://([^:/]+).*|\1|')
+            # Извлекаем хост из ссылки
+            HOST=$(echo "$line" | sed -E 's|(hysteria|vless|trojan)://([^:/]+).*|\2|')
             if [ -n "$HOST" ]; then
               PING=$(ping -c 2 -W 2 "$HOST" 2>/dev/null | grep -oP 'avg = \K[0-9.]+' | head -1)
               if [ -z "$PING" ]; then
                 PING=9999
               fi
-              echo "$PING|$line" >> speed_results.txt
+              # Добавляем приоритет: hysteria получает бонус -100 к пингу (всегда вперёд)
+              if [[ "$line" == hysteria://* ]]; then
+                PRIORITY=$((PING - 100))
+              else
+                PRIORITY=$PING
+              fi
+              echo "$PRIORITY|$PING|$line" >> speed_results.txt
             fi
           done < unique.txt
           
-          # Сортируем по скорости (по возрастанию ping) и берём первые 5
-          sort -n speed_results.txt | head -n 5 | cut -d'|' -f2 > final.txt
+          # Сортируем по приоритету (hysteria всегда выше)
+          sort -n speed_results.txt | head -n 5 | cut -d'|' -f3 > final.txt
           
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
