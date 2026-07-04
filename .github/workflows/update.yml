@@ -44,23 +44,44 @@ jobs:
           echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-      - name: Build list
+      - name: Build list with speed test
         run: |
           set -e
           export TZ=Europe/Moscow
           mkdir -p public
+          
           if [ ! -s all.txt ]; then
             echo "NO DATA" > public/white-list.txt
             exit 0
           fi
+          
           tr -d '\r' < all.txt > fixed.txt
           grep -aEo 'hysteria://[^[:space:]]+' fixed.txt > links.txt || true
+          
           if [ ! -s links.txt ]; then
             echo "NO HYSTERIA LINKS" > public/white-list.txt
             exit 0
           fi
+          
           awk '!seen[$0]++' links.txt > unique.txt
-          head -n 6 unique.txt > final.txt
+          
+          # Тестируем скорость каждого сервера (ping)
+          > speed_results.txt
+          while IFS= read -r line; do
+            # Извлекаем хост из ссылки hysteria://host:port
+            HOST=$(echo "$line" | sed -E 's|hysteria://([^:/]+).*|\1|')
+            if [ -n "$HOST" ]; then
+              PING=$(ping -c 2 -W 2 "$HOST" 2>/dev/null | grep -oP 'avg = \K[0-9.]+' | head -1)
+              if [ -z "$PING" ]; then
+                PING=9999
+              fi
+              echo "$PING|$line" >> speed_results.txt
+            fi
+          done < unique.txt
+          
+          # Сортируем по скорости (по возрастанию ping) и берём первые 5
+          sort -n speed_results.txt | head -n 5 | cut -d'|' -f2 > final.txt
+          
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
           COUNT=$(wc -l < final.txt)
@@ -79,7 +100,7 @@ jobs:
           
           i=1
           while IFS= read -r line; do
-            if [ $i -le 6 ]; then
+            if [ $i -le 5 ]; then
               echo "$line" >> public/white-list.txt
               echo "# 📱LTE Обход #$i" >> public/white-list.txt
             fi
