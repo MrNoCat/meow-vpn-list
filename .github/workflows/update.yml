@@ -1,4 +1,4 @@
-name: "@meowmeres 🏳️WHITE LISTS🏳️"
+name: "📱LTE Обход"
 
 on:
   workflow_dispatch:
@@ -18,27 +18,29 @@ jobs:
       - name: Download config
         run: |
           set -e
-          curl -fLsS \
+          curl -fLsS --retry 3 --retry-delay 5 \
             https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt \
             -o all.txt
-      - name: Get traffic stats (optional)
+
+      - name: Get traffic stats
         run: |
           set -e
           API_URL="${{ secrets.API_URL }}"
           API_KEY="${{ secrets.API_KEY }}"
-          if [ -z "$API_URL" ]; then
+          if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
             echo "UPLOAD=0" >> $GITHUB_ENV
             echo "DOWNLOAD=0" >> $GITHUB_ENV
             echo "TOTAL=0" >> $GITHUB_ENV
             exit 0
           fi
           RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL")
-          UPLOAD=$(echo "$RESPONSE" | jq '.upload // 0')
-          DOWNLOAD=$(echo "$RESPONSE" | jq '.download // 0')
+          UPLOAD=$(echo "$RESPONSE" | jq '.upload // 0' | sed 's/null/0/g')
+          DOWNLOAD=$(echo "$RESPONSE" | jq '.download // 0' | sed 's/null/0/g')
           TOTAL=$((UPLOAD + DOWNLOAD))
           echo "UPLOAD=$UPLOAD" >> $GITHUB_ENV
           echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+
       - name: Build list
         run: |
           set -e
@@ -49,29 +51,43 @@ jobs:
             exit 0
           fi
           tr -d '\r' < all.txt > fixed.txt
-          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > links.txt || true
+          grep -aEo 'hysteria://[^[:space:]]+' fixed.txt > links.txt || true
           if [ ! -s links.txt ]; then
-            echo "NO LINKS FOUND" > public/white-list.txt
+            echo "NO HYSTERIA LINKS" > public/white-list.txt
             exit 0
           fi
-          awk '!seen[$0]++' links.txt > final.txt
+          awk '!seen[$0]++' links.txt > unique.txt
+          head -n 6 unique.txt > final.txt
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
           COUNT=$(wc -l < final.txt)
           UPLOAD=${UPLOAD:-0}
           DOWNLOAD=${DOWNLOAD:-0}
           TOTAL=${TOTAL:-0}
+          
+          # Формируем заголовок с именами серверов
           {
-            echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
+            echo "# profile-title: 📱LTE Обход"
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
             echo ""
-            cat final.txt
           } > public/white-list.txt
+          
+          # Добавляем каждый сервер с именем
+          i=1
+          while IFS= read -r line; do
+            if [ $i -le 6 ]; then
+              echo "$line" >> public/white-list.txt
+              echo "# 📱LTE Обход #$i" >> public/white-list.txt
+            fi
+            i=$((i+1))
+          done < final.txt
+          
           cp final.txt public/android.txt
           echo "OK" > public/index.html
+
       - name: Setup Pages
         uses: actions/configure-pages@v4
 
@@ -83,14 +99,11 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-
     permissions:
       pages: write
       id-token: write
-
     environment:
       name: github-pages
-
     steps:
       - name: Deploy
         uses: actions/deploy-pages@v4
