@@ -1,12 +1,9 @@
-name: "📱LTE Обход"
+name: "@meowmeres 🏳️WHITE LISTS🏳️"
 
 on:
   workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
-
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
 permissions:
   pages: write
@@ -21,28 +18,33 @@ jobs:
       - name: Download config
         run: |
           set -e
-          curl -fLsS --retry 3 --retry-delay 5 \
+          curl -fLsS \
             https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt \
             -o all.txt
 
-      - name: Get traffic stats
+      - name: Get traffic stats (optional)
         run: |
           set -e
           API_URL="${{ secrets.API_URL }}"
           API_KEY="${{ secrets.API_KEY }}"
-          if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
+          if [ -z "$API_URL" ]; then
             echo "UPLOAD=0" >> $GITHUB_ENV
             echo "DOWNLOAD=0" >> $GITHUB_ENV
             echo "TOTAL=0" >> $GITHUB_ENV
             exit 0
           fi
           RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL")
-          UPLOAD=$(echo "$RESPONSE" | jq '.upload // 0' | sed 's/null/0/g')
-          DOWNLOAD=$(echo "$RESPONSE" | jq '.download // 0' | sed 's/null/0/g')
+          UPLOAD=$(echo "$RESPONSE" | jq '.upload // 0')
+          DOWNLOAD=$(echo "$RESPONSE" | jq '.download // 0')
           TOTAL=$((UPLOAD + DOWNLOAD))
           echo "UPLOAD=$UPLOAD" >> $GITHUB_ENV
           echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+
+      - name: Install speed test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc
 
       - name: Build list with speed test
         run: |
@@ -56,72 +58,88 @@ jobs:
           fi
           
           tr -d '\r' < all.txt > fixed.txt
+          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > links.txt || true
           
-          # Сначала вытаскиваем hysteria (приоритет)
-          grep -aEo 'hysteria://[^[:space:]]+' fixed.txt > hysteria_links.txt || true
-          
-          # Потом vless и trojan (запасные)
-          grep -aEo '(vless|trojan)://[^[:space:]]+' fixed.txt > other_links.txt || true
-          
-          # Объединяем: сначала hysteria, потом остальные
-          cat hysteria_links.txt other_links.txt > all_links.txt
-          
-          if [ ! -s all_links.txt ]; then
-            echo "NO LINKS" > public/white-list.txt
+          if [ ! -s links.txt ]; then
+            echo "NO LINKS FOUND" > public/white-list.txt
             exit 0
           fi
           
-          awk '!seen[$0]++' all_links.txt > unique.txt
+          # Remove duplicates
+          awk '!seen[$0]++' links.txt > unique.txt
           
-          # Тестируем скорость каждого сервера
+          # Test speed for each server (select top 5)
+          echo "Testing server speeds..."
+          
+          # Create temp file for results
           > speed_results.txt
-          while IFS= read -r line; do
-            # Извлекаем хост из ссылки
-            HOST=$(echo "$line" | sed -E 's|(hysteria|vless|trojan)://([^:/]+).*|\2|')
-            if [ -n "$HOST" ]; then
-              PING=$(ping -c 2 -W 2 "$HOST" 2>/dev/null | grep -oP 'avg = \K[0-9.]+' | head -1)
-              if [ -z "$PING" ]; then
-                PING=9999
-              fi
-              # Добавляем приоритет: hysteria получает бонус -100 к пингу (всегда вперёд)
-              if [[ "$line" == hysteria://* ]]; then
-                PRIORITY=$((PING - 100))
+          
+          # Process each server
+          while IFS= read -r link; do
+            # Extract domain/IP from link
+            if [[ $link =~ vless://([^@]+)@([^:]+):([0-9]+) ]]; then
+              HOST="${BASH_REMATCH[2]}"
+              PORT="${BASH_REMATCH[3]}"
+              
+              # Quick ping test (timeout 2 seconds)
+              PING_TIME=$(ping -c 1 -W 2 "$HOST" 2>/dev/null | grep 'time=' | head -1 | sed 's/.*time=//' | cut -d' ' -f1)
+              
+              if [ ! -z "$PING_TIME" ]; then
+                echo "$PING_TIME|$link" >> speed_results.txt
               else
-                PRIORITY=$PING
+                # If ping fails, try with port using nc
+                NC_TIME=$(timeout 2 nc -zv "$HOST" "$PORT" 2>&1 | grep -o 'Connected' && echo "1000" || echo "9999")
+                if [ "$NC_TIME" = "1000" ]; then
+                  echo "1000|$link" >> speed_results.txt
+                fi
               fi
-              echo "$PRIORITY|$PING|$line" >> speed_results.txt
+            else
+              # Fallback: basic ping without port extraction
+              HOST=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///')
+              PING_TIME=$(ping -c 1 -W 2 "$HOST" 2>/dev/null | grep 'time=' | head -1 | sed 's/.*time=//' | cut -d' ' -f1)
+              if [ ! -z "$PING_TIME" ]; then
+                echo "$PING_TIME|$link" >> speed_results.txt
+              fi
             fi
           done < unique.txt
           
-          # Сортируем по приоритету (hysteria всегда выше)
-          sort -n speed_results.txt | head -n 5 | cut -d'|' -f3 > final.txt
+          # Sort by ping time (ascending) and take top 5
+          if [ -s speed_results.txt ]; then
+            sort -n speed_results.txt | head -5 | cut -d'|' -f2 > final.txt
+            
+            # Add LTE Обход names
+            COUNT=1
+            while IFS= read -r link; do
+              echo "📱LTE Обход #$COUNT" >> temp_names.txt
+              echo "$link" >> temp_names.txt
+              ((COUNT++))
+            done < final.txt
+            mv temp_names.txt final.txt
+          else
+            echo "NO RESPONSIVE SERVERS" > public/white-list.txt
+            exit 0
+          fi
           
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          COUNT=$(wc -l < final.txt)
+          COUNT=$(wc -l < final.txt | xargs)
           UPLOAD=${UPLOAD:-0}
           DOWNLOAD=${DOWNLOAD:-0}
           TOTAL=${TOTAL:-0}
           
           {
-            echo "# profile-title: 📱LTE Обход"
+            echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT"
             echo ""
+            cat final.txt
           } > public/white-list.txt
           
-          i=1
-          while IFS= read -r line; do
-            if [ $i -le 5 ]; then
-              echo "$line" >> public/white-list.txt
-              echo "# 📱LTE Обход #$i" >> public/white-list.txt
-            fi
-            i=$((i+1))
-          done < final.txt
+          # Extract just the links for android.txt
+          grep -E '(vless|trojan|ss)://' final.txt > public/android.txt 2>/dev/null || echo "" > public/android.txt
           
-          cp final.txt public/android.txt
           echo "OK" > public/index.html
 
       - name: Setup Pages
@@ -135,11 +153,14 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+
     permissions:
       pages: write
       id-token: write
+
     environment:
       name: github-pages
+
     steps:
       - name: Deploy
         uses: actions/deploy-pages@v4
