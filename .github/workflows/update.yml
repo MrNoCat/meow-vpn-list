@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
       - name: Download config
@@ -42,7 +42,7 @@ jobs:
           echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-      - name: Build list with geo filtering
+      - name: Build list with working servers only
         run: |
           set -e
           export TZ=Europe/Moscow
@@ -68,59 +68,103 @@ jobs:
           # Remove duplicates
           awk '!seen[$0]++' links.txt > unique.txt
           
-          # Create separate lists for Russia and other countries
-          > russia_servers.txt
-          > other_servers.txt
+          # Check if servers are working
+          echo "Testing server availability..."
+          > working_russia.txt
+          > working_other.txt
+          > failed.txt
           
-          # Process each server and detect country by IP
+          # Test each server (limit to first 50 to save time)
+          head -50 unique.txt > test_servers.txt
+          
           while IFS= read -r link; do
-            # Extract host from link
+            # Extract host and port
             if [[ $link =~ vless://([^@]+)@([^:]+):([0-9]+) ]]; then
               HOST="${BASH_REMATCH[2]}"
+              PORT="${BASH_REMATCH[3]}"
+            elif [[ $link =~ trojan://([^@]+)@([^:]+):([0-9]+) ]]; then
+              HOST="${BASH_REMATCH[2]}"
+              PORT="${BASH_REMATCH[3]}"
+            elif [[ $link =~ ss://[^@]+@([^:]+):([0-9]+) ]]; then
+              HOST="${BASH_REMATCH[1]}"
+              PORT="${BASH_REMATCH[2]}"
             else
               HOST=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f1)
+              PORT=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f2 | cut -d'/' -f1)
+              [ -z "$PORT" ] && PORT="443"
             fi
             
-            # Get country using ip-api.com (fast, free, no API key needed)
-            COUNTRY=$(curl -s --max-time 2 "http://ip-api.com/line/$HOST?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
-            
-            # Check if Russia
-            if [[ "$COUNTRY" == "RU" ]]; then
-              echo "$link" >> russia_servers.txt
+            # Check if port is open using nc (netcat) with timeout
+            if timeout 2 nc -zv "$HOST" "$PORT" 2>&1 | grep -q "Connected"; then
+              # Server is working, check country
+              COUNTRY=$(curl -s --max-time 2 "http://ip-api.com/line/$HOST?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
+              if [[ "$COUNTRY" == "RU" ]]; then
+                echo "$link" >> working_russia.txt
+              else
+                echo "$link" >> working_other.txt
+              fi
             else
-              echo "$link" >> other_servers.txt
+              echo "$link" >> failed.txt
             fi
-          done < unique.txt
+          done < test_servers.txt
           
           # Take 3 from Russia and 2 from other countries
           > selected.txt
-          head -3 russia_servers.txt >> selected.txt
-          head -2 other_servers.txt >> selected.txt
           
-          # If not enough Russia servers, take more from other countries
-          RUSSIA_COUNT=$(wc -l < russia_servers.txt)
-          OTHER_COUNT=$(wc -l < other_servers.txt)
+          RUSSIA_COUNT=$(wc -l < working_russia.txt)
+          OTHER_COUNT=$(wc -l < working_other.txt)
           
-          if [ "$RUSSIA_COUNT" -lt 3 ]; then
-            # Need more from other countries
-            NEEDED=$((5 - RUSSIA_COUNT))
-            if [ "$OTHER_COUNT" -ge "$NEEDED" ]; then
-              head -$NEEDED other_servers.txt > temp.txt
-              cat russia_servers.txt > selected.txt
-              cat temp.txt >> selected.txt
-            else
-              cat russia_servers.txt > selected.txt
-              head -$((5 - RUSSIA_COUNT)) other_servers.txt >> selected.txt
-            fi
+          echo "Working Russia servers: $RUSSIA_COUNT"
+          echo "Working other servers: $OTHER_COUNT"
+          
+          # Select servers
+          if [ "$RUSSIA_COUNT" -ge 3 ]; then
+            head -3 working_russia.txt >> selected.txt
+          else
+            cat working_russia.txt >> selected.txt
           fi
           
-          # If no servers at all, use first 5 from unique
+          if [ "$OTHER_COUNT" -ge 2 ]; then
+            head -2 working_other.txt >> selected.txt
+          else
+            cat working_other.txt >> selected.txt
+          fi
+          
+          # If not enough servers, try more from unique list without country filter
+          SELECTED_COUNT=$(wc -l < selected.txt)
+          if [ "$SELECTED_COUNT" -lt 5 ]; then
+            echo "Not enough working servers, trying without geo filter..."
+            # Test more servers from unique.txt (skip first 50)
+            tail -n +51 unique.txt | head -50 | while IFS= read -r link; do
+              if [[ $link =~ vless://([^@]+)@([^:]+):([0-9]+) ]]; then
+                HOST="${BASH_REMATCH[2]}"
+                PORT="${BASH_REMATCH[3]}"
+              else
+                HOST=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f1)
+                PORT=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f2 | cut -d'/' -f1)
+                [ -z "$PORT" ] && PORT="443"
+              fi
+              
+              if timeout 2 nc -zv "$HOST" "$PORT" 2>&1 | grep -q "Connected"; then
+                echo "$link" >> selected.txt
+                SELECTED_COUNT=$((SELECTED_COUNT + 1))
+                if [ "$SELECTED_COUNT" -ge 5 ]; then
+                  break
+                fi
+              fi
+            done
+          fi
+          
+          # If still no servers, use first 5 without checking
           if [ ! -s selected.txt ]; then
+            echo "No working servers found, using first 5 from list"
             head -5 unique.txt > selected.txt
           fi
           
-          # Remove empty lines
+          # Remove empty lines and limit to 5
           sed -i '/^$/d' selected.txt
+          head -5 selected.txt > temp.txt
+          mv temp.txt selected.txt
           
           # Add names
           COUNT=1
@@ -130,6 +174,10 @@ jobs:
             echo "$link" >> final_with_names.txt
             ((COUNT++))
           done < selected.txt
+          
+          # Add server info
+          RUSSIA_FINAL=$(grep -Ff working_russia.txt selected.txt | wc -l || echo 0)
+          OTHER_FINAL=$(grep -Ff working_other.txt selected.txt | wc -l || echo 0)
           
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
@@ -144,12 +192,13 @@ jobs:
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT_LINES"
+            echo "# Russia: $RUSSIA_FINAL | Other: $OTHER_FINAL"
             echo ""
             cat final_with_names.txt
           } > public/white-list.txt
           
           cat selected.txt > public/android.txt
-          echo "✅ Updated: $DATE $TIME" > public/index.html
+          echo "✅ Updated: $DATE $TIME (RU: $RUSSIA_FINAL, Other: $OTHER_FINAL)" > public/index.html
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
