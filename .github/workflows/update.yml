@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "*/30 * * * *"
 
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
 permissions:
   pages: write
   id-token: write
@@ -65,7 +68,6 @@ jobs:
           DOWNLOAD=${DOWNLOAD:-0}
           TOTAL=${TOTAL:-0}
           
-          # Формируем заголовок с именами серверов
           {
             echo "# profile-title: 📱LTE Обход"
             echo "# profile-update-interval: 1"
@@ -75,7 +77,6 @@ jobs:
             echo ""
           } > public/white-list.txt
           
-          # Добавляем каждый сервер с именем
           i=1
           while IFS= read -r line; do
             if [ $i -le 6 ]; then
