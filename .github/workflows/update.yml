@@ -13,16 +13,17 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 3  # Лимит времени выполнения
 
     steps:
       - name: Download config
         run: |
-          set -e
-          curl -fLsS \
+          curl -fLsS --connect-timeout 10 --max-time 30 \
             https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt \
-            -o all.txt
+            -o all.txt || echo "" > all.txt
 
       - name: Get traffic stats (optional)
+        if: env.API_URL != ''
         run: |
           set -e
           API_URL="${{ secrets.API_URL }}"
@@ -33,96 +34,57 @@ jobs:
             echo "TOTAL=0" >> $GITHUB_ENV
             exit 0
           fi
-          RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL")
-          UPLOAD=$(echo "$RESPONSE" | jq '.upload // 0')
-          DOWNLOAD=$(echo "$RESPONSE" | jq '.download // 0')
+          RESPONSE=$(curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$API_URL" || echo "{}")
+          UPLOAD=$(echo "$RESPONSE" | jq -r '.upload // 0')
+          DOWNLOAD=$(echo "$RESPONSE" | jq -r '.download // 0')
           TOTAL=$((UPLOAD + DOWNLOAD))
           echo "UPLOAD=$UPLOAD" >> $GITHUB_ENV
           echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-      - name: Install speed test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc
-
-      - name: Build list with speed test
+      - name: Fast build list (no speed test)
         run: |
           set -e
           export TZ=Europe/Moscow
           mkdir -p public
           
+          # Если файл пустой или нет данных
           if [ ! -s all.txt ]; then
             echo "NO DATA" > public/white-list.txt
+            echo "NO DATA" > public/android.txt
+            echo "NO DATA" > public/index.html
             exit 0
           fi
           
-          tr -d '\r' < all.txt > fixed.txt
-          grep -aEo '(vless|trojan|ss)://[^[:space:]]+' fixed.txt > links.txt || true
+          # Быстрая очистка и извлечение ссылок
+          tr -d '\r' < all.txt | grep -aEo '(vless|trojan|ss)://[^[:space:]]+' > links.txt || true
           
+          # Если нет ссылок
           if [ ! -s links.txt ]; then
             echo "NO LINKS FOUND" > public/white-list.txt
+            echo "NO LINKS FOUND" > public/android.txt
+            echo "NO LINKS FOUND" > public/index.html
             exit 0
           fi
           
-          # Remove duplicates
+          # Удаление дубликатов (быстро)
           awk '!seen[$0]++' links.txt > unique.txt
           
-          # Test speed for each server (select top 5)
-          echo "Testing server speeds..."
+          # Просто берем первые 5 ссылок (без проверки скорости)
+          head -5 unique.txt > final.txt
           
-          # Create temp file for results
-          > speed_results.txt
-          
-          # Process each server
+          # Формируем вывод с именами
+          COUNT=1
+          > final_with_names.txt
           while IFS= read -r link; do
-            # Extract domain/IP from link
-            if [[ $link =~ vless://([^@]+)@([^:]+):([0-9]+) ]]; then
-              HOST="${BASH_REMATCH[2]}"
-              PORT="${BASH_REMATCH[3]}"
-              
-              # Quick ping test (timeout 2 seconds)
-              PING_TIME=$(ping -c 1 -W 2 "$HOST" 2>/dev/null | grep 'time=' | head -1 | sed 's/.*time=//' | cut -d' ' -f1)
-              
-              if [ ! -z "$PING_TIME" ]; then
-                echo "$PING_TIME|$link" >> speed_results.txt
-              else
-                # If ping fails, try with port using nc
-                NC_TIME=$(timeout 2 nc -zv "$HOST" "$PORT" 2>&1 | grep -o 'Connected' && echo "1000" || echo "9999")
-                if [ "$NC_TIME" = "1000" ]; then
-                  echo "1000|$link" >> speed_results.txt
-                fi
-              fi
-            else
-              # Fallback: basic ping without port extraction
-              HOST=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///')
-              PING_TIME=$(ping -c 1 -W 2 "$HOST" 2>/dev/null | grep 'time=' | head -1 | sed 's/.*time=//' | cut -d' ' -f1)
-              if [ ! -z "$PING_TIME" ]; then
-                echo "$PING_TIME|$link" >> speed_results.txt
-              fi
-            fi
-          done < unique.txt
-          
-          # Sort by ping time (ascending) and take top 5
-          if [ -s speed_results.txt ]; then
-            sort -n speed_results.txt | head -5 | cut -d'|' -f2 > final.txt
-            
-            # Add LTE Обход names
-            COUNT=1
-            while IFS= read -r link; do
-              echo "📱LTE Обход #$COUNT" >> temp_names.txt
-              echo "$link" >> temp_names.txt
-              ((COUNT++))
-            done < final.txt
-            mv temp_names.txt final.txt
-          else
-            echo "NO RESPONSIVE SERVERS" > public/white-list.txt
-            exit 0
-          fi
+            echo "📱LTE Обход #$COUNT" >> final_with_names.txt
+            echo "$link" >> final_with_names.txt
+            ((COUNT++))
+          done < final.txt
           
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          COUNT=$(wc -l < final.txt | xargs)
+          COUNT_LINES=$(wc -l < final_with_names.txt | xargs)
           UPLOAD=${UPLOAD:-0}
           DOWNLOAD=${DOWNLOAD:-0}
           TOTAL=${TOTAL:-0}
@@ -132,15 +94,15 @@ jobs:
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
-            echo "# servers: $COUNT"
+            echo "# servers: $COUNT_LINES"
             echo ""
-            cat final.txt
+            cat final_with_names.txt
           } > public/white-list.txt
           
-          # Extract just the links for android.txt
-          grep -E '(vless|trojan|ss)://' final.txt > public/android.txt 2>/dev/null || echo "" > public/android.txt
+          # Только ссылки для android
+          cat final.txt > public/android.txt
           
-          echo "OK" > public/index.html
+          echo "✅ Updated: $DATE $TIME" > public/index.html
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
@@ -153,6 +115,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 2
 
     permissions:
       pages: write
