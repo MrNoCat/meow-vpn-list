@@ -42,7 +42,7 @@ jobs:
           echo "DOWNLOAD=$DOWNLOAD" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-      - name: Build list with working servers only
+      - name: Build list with hysteria servers only
         run: |
           set -e
           export TZ=Europe/Moscow
@@ -55,37 +55,67 @@ jobs:
             exit 0
           fi
           
-          # Extract links
-          tr -d '\r' < all.txt | grep -aEo '(vless|trojan|ss)://[^[:space:]]+' > links.txt || true
+          # Extract vless links
+          tr -d '\r' < all.txt | grep -aEo 'vless://[^[:space:]]+' > links.txt || true
           
           if [ ! -s links.txt ]; then
-            echo "NO LINKS FOUND" > public/white-list.txt
-            echo "NO LINKS FOUND" > public/android.txt
-            echo "NO LINKS FOUND" > public/index.html
+            echo "NO VLESS LINKS FOUND" > public/white-list.txt
+            echo "NO VLESS LINKS FOUND" > public/android.txt
+            echo "NO VLESS LINKS FOUND" > public/index.html
             exit 0
           fi
           
           # Remove duplicates
           awk '!seen[$0]++' links.txt > unique.txt
           
-          # Check if servers are working
+          # Filter only hysteria servers
+          echo "Filtering hysteria servers..."
+          > hysteria_servers.txt
+          
+          while IFS= read -r link; do
+            # Check if link contains hysteria in host or sni
+            if [[ $link =~ (host|sni)=([^&]+) ]]; then
+              VALUE="${BASH_REMATCH[2]}"
+              # URL decode the value
+              DECODED=$(echo "$VALUE" | sed 's/%/\\x/g' | xargs -0 printf "%b" 2>/dev/null || echo "$VALUE")
+              if echo "$DECODED" | grep -qi "hysteria"; then
+                echo "$link" >> hysteria_servers.txt
+              fi
+            fi
+          done < unique.txt
+          
+          # If no hysteria servers found, try alternative method
+          if [ ! -s hysteria_servers.txt ]; then
+            echo "No hysteria servers found with host/sni, trying alternative detection..."
+            grep -i "hysteria" unique.txt > hysteria_servers.txt || true
+          fi
+          
+          # If still no servers, try looking for .hysteria. in URL
+          if [ ! -s hysteria_servers.txt ]; then
+            echo "Trying to find .hysteria. in links..."
+            grep -i "\.hysteria\." unique.txt > hysteria_servers.txt || true
+          fi
+          
+          # If no hysteria servers at all, use any vless servers
+          if [ ! -s hysteria_servers.txt ]; then
+            echo "No hysteria servers found, using all vless servers"
+            cp unique.txt hysteria_servers.txt
+          fi
+          
+          HYSTERIA_COUNT=$(wc -l < hysteria_servers.txt)
+          echo "Found $HYSTERIA_COUNT hysteria servers"
+          
+          # Test if servers are working (check port open)
           echo "Testing server availability..."
           > working_russia.txt
           > working_other.txt
-          > failed.txt
           
-          # Test each server (limit to first 50 to save time)
-          head -50 unique.txt > test_servers.txt
+          # Test first 50 hysteria servers
+          head -50 hysteria_servers.txt > test_servers.txt
           
           while IFS= read -r link; do
             # Extract host and port
-            if [[ $link =~ vless://([^@]+)@([^:]+):([0-9]+) ]]; then
-              HOST="${BASH_REMATCH[2]}"
-              PORT="${BASH_REMATCH[3]}"
-            elif [[ $link =~ trojan://([^@]+)@([^:]+):([0-9]+) ]]; then
-              HOST="${BASH_REMATCH[2]}"
-              PORT="${BASH_REMATCH[3]}"
-            elif [[ $link =~ ss://[^@]+@([^:]+):([0-9]+) ]]; then
+            if [[ $link =~ vless://[^@]+@([^:]+):([0-9]+) ]]; then
               HOST="${BASH_REMATCH[1]}"
               PORT="${BASH_REMATCH[2]}"
             else
@@ -94,7 +124,7 @@ jobs:
               [ -z "$PORT" ] && PORT="443"
             fi
             
-            # Check if port is open using nc (netcat) with timeout
+            # Check if port is open
             if timeout 2 nc -zv "$HOST" "$PORT" 2>&1 | grep -q "Connected"; then
               # Server is working, check country
               COUNTRY=$(curl -s --max-time 2 "http://ip-api.com/line/$HOST?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
@@ -103,19 +133,17 @@ jobs:
               else
                 echo "$link" >> working_other.txt
               fi
-            else
-              echo "$link" >> failed.txt
             fi
           done < test_servers.txt
           
-          # Take 3 from Russia and 2 from other countries
+          # Select 3 from Russia and 2 from other countries
           > selected.txt
           
           RUSSIA_COUNT=$(wc -l < working_russia.txt)
           OTHER_COUNT=$(wc -l < working_other.txt)
           
-          echo "Working Russia servers: $RUSSIA_COUNT"
-          echo "Working other servers: $OTHER_COUNT"
+          echo "Working hysteria Russia servers: $RUSSIA_COUNT"
+          echo "Working hysteria other servers: $OTHER_COUNT"
           
           # Select servers
           if [ "$RUSSIA_COUNT" -ge 3 ]; then
@@ -130,15 +158,14 @@ jobs:
             cat working_other.txt >> selected.txt
           fi
           
-          # If not enough servers, try more from unique list without country filter
+          # If not enough servers, try more from hysteria list
           SELECTED_COUNT=$(wc -l < selected.txt)
           if [ "$SELECTED_COUNT" -lt 5 ]; then
-            echo "Not enough working servers, trying without geo filter..."
-            # Test more servers from unique.txt (skip first 50)
-            tail -n +51 unique.txt | head -50 | while IFS= read -r link; do
-              if [[ $link =~ vless://([^@]+)@([^:]+):([0-9]+) ]]; then
-                HOST="${BASH_REMATCH[2]}"
-                PORT="${BASH_REMATCH[3]}"
+            echo "Not enough working hysteria servers, trying more..."
+            tail -n +51 hysteria_servers.txt | head -50 | while IFS= read -r link; do
+              if [[ $link =~ vless://[^@]+@([^:]+):([0-9]+) ]]; then
+                HOST="${BASH_REMATCH[1]}"
+                PORT="${BASH_REMATCH[2]}"
               else
                 HOST=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f1)
                 PORT=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f2 | cut -d'/' -f1)
@@ -155,10 +182,10 @@ jobs:
             done
           fi
           
-          # If still no servers, use first 5 without checking
+          # If still no servers, use first 5 hysteria servers without checking
           if [ ! -s selected.txt ]; then
-            echo "No working servers found, using first 5 from list"
-            head -5 unique.txt > selected.txt
+            echo "No working hysteria servers found, using first 5 hysteria servers"
+            head -5 hysteria_servers.txt > selected.txt
           fi
           
           # Remove empty lines and limit to 5
@@ -187,18 +214,19 @@ jobs:
           TOTAL=${TOTAL:-0}
           
           {
-            echo "# profile-title: @meowmeres 🏳️WHITE LISTS🏳️"
+            echo "# profile-title: @meowmeres 🏳️HYSTERIA LISTS🏳️"
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $COUNT_LINES"
+            echo "# Hysteria servers: $HYSTERIA_COUNT total"
             echo "# Russia: $RUSSIA_FINAL | Other: $OTHER_FINAL"
             echo ""
             cat final_with_names.txt
           } > public/white-list.txt
           
           cat selected.txt > public/android.txt
-          echo "✅ Updated: $DATE $TIME (RU: $RUSSIA_FINAL, Other: $OTHER_FINAL)" > public/index.html
+          echo "✅ Updated: $DATE $TIME (Hysteria: RU $RUSSIA_FINAL, Other $OTHER_FINAL)" > public/index.html
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
