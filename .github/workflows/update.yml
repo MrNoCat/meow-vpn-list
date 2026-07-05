@@ -15,9 +15,11 @@ env:
   MAX_SERVERS: 5
   RUSSIA_SERVERS: 3
   OTHER_SERVERS: 2
-  TIMEOUT: 3
-  PARALLEL_CHECKS: 20
-  MAX_CHECK_SERVERS: 200
+  TIMEOUT: 2
+  PARALLEL_CHECKS: 10
+  MAX_CHECK_SERVERS: 150
+  SPEED_TEST_TIMEOUT: 3
+  PING_COUNT: 3
 
 jobs:
   build:
@@ -28,7 +30,7 @@ jobs:
       - name: Setup environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y parallel jq netcat-openbsd
+          sudo apt-get install -y parallel jq netcat-openbsd fping bc
           echo "TZ=Europe/Moscow" >> $GITHUB_ENV
 
       - name: Download and validate config
@@ -60,9 +62,8 @@ jobs:
           API_URL="${{ secrets.API_URL }}"
           API_KEY="${{ secrets.API_KEY }}"
           
-          # Пропускаем если нет API данных
           if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
-            echo "::warning::API credentials not configured, skipping traffic stats"
+            echo "::warning::API credentials not configured"
             echo "upload=0" >> $GITHUB_OUTPUT
             echo "download=0" >> $GITHUB_OUTPUT
             echo "total=0" >> $GITHUB_OUTPUT
@@ -70,19 +71,14 @@ jobs:
           fi
           
           echo "Fetching traffic stats..."
-          
-          # Безопасный запрос с проверкой ответа
           RESPONSE=$(curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$API_URL" 2>/dev/null) || {
-            echo "::warning::Failed to get traffic stats"
             echo "upload=0" >> $GITHUB_OUTPUT
             echo "download=0" >> $GITHUB_OUTPUT
             echo "total=0" >> $GITHUB_OUTPUT
             exit 0
           }
           
-          # Проверка валидности JSON
           if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
-            echo "::warning::Invalid JSON response from API"
             echo "upload=0" >> $GITHUB_OUTPUT
             echo "download=0" >> $GITHUB_OUTPUT
             echo "total=0" >> $GITHUB_OUTPUT
@@ -103,8 +99,6 @@ jobs:
           set -e
           
           echo "Extracting VLESS links..."
-          
-          # Извлечение и очистка VLESS ссылок
           tr -d '\r' < all.txt | \
             grep -aEo 'vless://[^[:space:]]+' | \
             awk '!seen[$0]++' > unique.txt
@@ -115,7 +109,6 @@ jobs:
             exit 1
           fi
           
-          # Фильтрация подозрительных доменов
           grep -vE '(example\.com|test\.com|localhost|127\.0\.0\.1)' unique.txt > filtered.txt
           mv filtered.txt unique.txt
           
@@ -129,62 +122,46 @@ jobs:
           set -e
           
           echo "Detecting hysteria servers..."
-          
-          # Поиск hysteria серверов
-          # Метод 1: Поиск в параметрах host/sni
           grep -E '\?(.*&)?(host|sni)=[^&]*hysteria' unique.txt > hysteria_temp1.txt 2>/dev/null || true
-          
-          # Метод 2: Поиск в самом URL
           grep -i "hysteria" unique.txt > hysteria_temp2.txt 2>/dev/null || true
-          
-          # Объединение и удаление дубликатов
           cat hysteria_temp1.txt hysteria_temp2.txt | sort -u > hysteria_servers.txt 2>/dev/null || true
           
-          # Если не найдено hysteria - используем все ссылки
           if [ ! -s hysteria_servers.txt ]; then
             echo "::warning::No hysteria servers found, using all links"
             cp unique.txt hysteria_servers.txt
           fi
           
-          # Очистка временных файлов
           rm -f hysteria_temp1.txt hysteria_temp2.txt
           
           HYSTERIA_COUNT=$(wc -l < hysteria_servers.txt)
           echo "hysteria_count=$HYSTERIA_COUNT" >> $GITHUB_OUTPUT
           echo "Found $HYSTERIA_COUNT hysteria servers"
 
-      - name: Check server availability
+      - name: Check server quality (ping + port + speed test)
         id: check
         run: |
           set -e
           
-          echo "Checking server availability..."
+          echo "Checking server quality..."
           
           # Кеш для геолокации
           declare -A IP_CACHE
           
-          # Функция получения страны с кешированием
           get_country() {
             local ip="$1"
-            
-            # Проверка кеша
             if [[ -n "${IP_CACHE[$ip]}" ]]; then
               echo "${IP_CACHE[$ip]}"
               return
             fi
-            
-            # Запрос к API с таймаутом
             local country
             country=$(curl -s --max-time 2 "http://ip-api.com/line/$ip?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
-            
-            # Кеширование результата
             IP_CACHE[$ip]="$country"
             echo "$country"
           }
           export -f get_country
           
-          # Функция проверки сервера
-          check_server() {
+          # Функция проверки качества сервера
+          check_server_quality() {
             local link="$1"
             local host port
             
@@ -196,25 +173,70 @@ jobs:
               host="${BASH_REMATCH[1]}"
               port="${BASH_REMATCH[2]}"
             else
-              # Fallback - извлечение из URL
               host=$(echo "$link" | sed -n 's/.*vless:\/\/[^@]*@\([^:]*\):.*/\1/p')
               port=$(echo "$link" | sed -n 's/.*:\([0-9]*\)[^0-9]*$/\1/p')
               [ -z "$port" ] && port="443"
             fi
             
-            # Валидация
             if [ -z "$host" ] || [ -z "$port" ]; then
               return 1
             fi
             
-            # Проверка порта с таймаутом
-            if timeout ${{ env.TIMEOUT }} nc -zv "$host" "$port" 2>&1 | grep -q "Connected"; then
-              # Получение страны
-              country=$(get_country "$host")
-              echo "$link|$country"
+            # 1. Проверка порта (быстрая)
+            if ! timeout ${{ env.TIMEOUT }} nc -zv "$host" "$port" 2>&1 | grep -q "Connected"; then
+              return 1
             fi
+            
+            # 2. Измерение ping (более точное)
+            local ping_avg="999"
+            if command -v fping >/dev/null 2>&1; then
+              ping_avg=$(fping -c ${{ env.PING_COUNT }} -t 1000 "$host" 2>/dev/null | \
+                grep -o 'avg = [0-9.]*' | cut -d' ' -f3 | head -1)
+              [ -z "$ping_avg" ] && ping_avg="999"
+            else
+              # Fallback на обычный ping
+              ping_avg=$(ping -c ${{ env.PING_COUNT }} -W 1 "$host" 2>/dev/null | \
+                grep 'avg' | grep -o '[0-9.]*' | tail -1)
+              [ -z "$ping_avg" ] && ping_avg="999"
+            fi
+            
+            # 3. Тест скорости через загрузку маленького файла
+            local speed="0"
+            local speed_test=$(curl -s --max-time ${{ env.SPEED_TEST_TIMEOUT }} \
+              -w "%{speed_download}" -o /dev/null \
+              "http://$host:$port/" 2>/dev/null || echo "0")
+            speed=$(echo "$speed_test" | cut -d'.' -f1)
+            [ -z "$speed" ] && speed="0"
+            
+            # 4. Получение страны
+            country=$(get_country "$host")
+            
+            # Весовые коэффициенты
+            # ping: <50ms - 100 баллов, 50-150ms - 70 баллов, >150ms - 30 баллов
+            if [ "$ping_avg" != "999" ]; then
+              ping_score=$(echo "$ping_avg" | awk '{if ($1 < 50) print 100; else if ($1 < 150) print 70; else if ($1 < 300) print 30; else print 10}')
+            else
+              ping_score=0
+            fi
+            
+            # speed: >1MB/s - 100 баллов, >100KB/s - 70 баллов, >10KB/s - 30 баллов
+            if [ "$speed" -gt 1048576 ]; then
+              speed_score=100
+            elif [ "$speed" -gt 102400 ]; then
+              speed_score=70
+            elif [ "$speed" -gt 10240 ]; then
+              speed_score=30
+            else
+              speed_score=10
+            fi
+            
+            # Итоговый рейтинг
+            total_score=$((ping_score * 60 / 100 + speed_score * 40 / 100))
+            
+            # Вывод с рейтингом
+            echo "$total_score|$link|$country|${ping_avg}|${speed}"
           }
-          export -f check_server
+          export -f check_server_quality
           
           # Проверка серверов с лимитом
           TOTAL_HYSTERIA=$(wc -l < hysteria_servers.txt)
@@ -222,45 +244,42 @@ jobs:
           
           echo "Checking first $CHECK_COUNT servers..."
           head -"$CHECK_COUNT" hysteria_servers.txt | \
-            parallel -j ${{ env.PARALLEL_CHECKS }} check_server {} > server_status.txt || true
+            parallel -j ${{ env.PARALLEL_CHECKS }} check_server_quality {} > server_quality.txt || true
           
-          # Парсинг результатов
-          grep -E '\|RU$' server_status.txt | cut -d'|' -f1 > working_russia.txt || true
-          grep -E '\|(US|DE|FR|GB|NL|CA|AU|SG|JP|KR|IT|ES|SE|NO|FI|DK|BE|CH|AT|NZ|HK|TW|IN|BR|MX|ZA|AE|IL)$' server_status.txt | cut -d'|' -f1 > working_other.txt || true
+          # Сортировка по рейтингу (от лучшего к худшему)
+          sort -t'|' -k1 -rn server_quality.txt > server_quality_sorted.txt || true
           
-          RUSSIA_COUNT=$(wc -l < working_russia.txt 2>/dev/null || echo 0)
-          OTHER_COUNT=$(wc -l < working_other.txt 2>/dev/null || echo 0)
+          # Разделение по странам с рейтингом
+          grep -E '\|RU\|' server_quality_sorted.txt > quality_russia.txt || true
+          grep -E '\|(US|DE|FR|GB|NL|CA|AU|SG|JP|KR|IT|ES|SE|NO|FI|DK|BE|CH|AT|NZ|HK|TW|IN|BR|MX|ZA|AE|IL)\|' server_quality_sorted.txt > quality_other.txt || true
+          
+          RUSSIA_COUNT=$(wc -l < quality_russia.txt 2>/dev/null || echo 0)
+          OTHER_COUNT=$(wc -l < quality_other.txt 2>/dev/null || echo 0)
           
           echo "russia_count=$RUSSIA_COUNT" >> $GITHUB_OUTPUT
           echo "other_count=$OTHER_COUNT" >> $GITHUB_OUTPUT
-          echo "Found $RUSSIA_COUNT working Russia servers, $OTHER_COUNT working other servers"
+          echo "Found $RUSSIA_COUNT quality Russia servers, $OTHER_COUNT quality other servers"
 
-      - name: Select best servers
+      - name: Select best servers by quality score
         id: select
         run: |
           set -e
           
-          echo "Selecting best servers..."
+          echo "Selecting best servers by quality score..."
           
           > selected.txt
           
-          # Функция безопасного добавления серверов
-          add_servers() {
-            local source="$1"
-            local count="$2"
-            
-            if [ -s "$source" ] && [ "$count" -gt 0 ]; then
-              head -"$count" "$source" >> selected.txt
-            fi
-          }
+          # Выбор лучших Russia серверов по рейтингу
+          if [ -s quality_russia.txt ]; then
+            head -${{ env.RUSSIA_SERVERS }} quality_russia.txt | cut -d'|' -f2 >> selected.txt
+          fi
           
-          # Выбор Russia серверов
-          add_servers working_russia.txt ${{ env.RUSSIA_SERVERS }}
+          # Выбор лучших other серверов по рейтингу
+          if [ -s quality_other.txt ]; then
+            head -${{ env.OTHER_SERVERS }} quality_other.txt | cut -d'|' -f2 >> selected.txt
+          fi
           
-          # Выбор других серверов
-          add_servers working_other.txt ${{ env.OTHER_SERVERS }}
-          
-          # Проверка дубликатов
+          # Удаление дубликатов
           sort -u selected.txt > selected_unique.txt
           mv selected_unique.txt selected.txt
           
@@ -268,15 +287,16 @@ jobs:
           SELECTED_COUNT=$(wc -l < selected.txt 2>/dev/null || echo 0)
           NEEDED=$(( ${{ env.MAX_SERVERS }} - SELECTED_COUNT ))
           
-          if [ "$NEEDED" -gt 0 ] && [ -s hysteria_servers.txt ]; then
+          if [ "$NEEDED" -gt 0 ] && [ -s server_quality_sorted.txt ]; then
             echo "Need $NEEDED more servers, adding fallback..."
             
-            # Добавляем серверы, которых нет в выбранных
-            grep -Fvxf selected.txt hysteria_servers.txt | \
+            # Добавляем серверы, которых нет в выбранных (с наилучшим рейтингом)
+            cut -d'|' -f2 server_quality_sorted.txt | \
+              grep -Fvxf selected.txt | \
               head -"$NEEDED" >> selected.txt || true
           fi
           
-          # Финальная очистка и лимит
+          # Финальная очистка
           sed -i '/^$/d' selected.txt
           sort -u selected.txt > selected_unique.txt
           mv selected_unique.txt selected.txt
@@ -293,34 +313,45 @@ jobs:
           set -e
           export TZ=Europe/Moscow
           
-          # Получение статистики трафика
           UPLOAD="${{ steps.traffic.outputs.upload || 0 }}"
           DOWNLOAD="${{ steps.traffic.outputs.download || 0 }}"
           TOTAL="${{ steps.traffic.outputs.total || 0 }}"
           
-          # Получение счетчиков
           FINAL_COUNT="${{ steps.select.outputs.final_count || 0 }}"
           HYSTERIA_COUNT="${{ steps.hysteria.outputs.hysteria_count || 0 }}"
           RUSSIA_COUNT="${{ steps.check.outputs.russia_count || 0 }}"
           OTHER_COUNT="${{ steps.check.outputs.other_count || 0 }}"
           TOTAL_LINKS="${{ steps.extract.outputs.total_links || 0 }}"
           
-          # Расчет используемых серверов
+          # Расчет используемых серверов с рейтингом
           RUSSIA_USED=0
           OTHER_USED=0
           
-          if [ -s working_russia.txt ] && [ -s selected.txt ]; then
-            RUSSIA_USED=$(grep -Ff working_russia.txt selected.txt 2>/dev/null | wc -l || echo 0)
+          if [ -s quality_russia.txt ] && [ -s selected.txt ]; then
+            RUSSIA_USED=$(grep -Ff selected.txt quality_russia.txt 2>/dev/null | wc -l || echo 0)
           fi
           
-          if [ -s working_other.txt ] && [ -s selected.txt ]; then
-            OTHER_USED=$(grep -Ff working_other.txt selected.txt 2>/dev/null | wc -l || echo 0)
+          if [ -s quality_other.txt ] && [ -s selected.txt ]; then
+            OTHER_USED=$(grep -Ff selected.txt quality_other.txt 2>/dev/null | wc -l || echo 0)
           fi
           
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
           
           echo "Generating output files..."
+          
+          # Создание списка с рейтингами для отладки
+          cat > public/quality_report.txt << EOF
+          ========================================
+          Server Quality Report - $DATE $TIME
+          ========================================
+          
+          Top Russia Servers:
+          $(head -10 quality_russia.txt 2>/dev/null | awk -F'|' '{print "Score: " $1 " | " $2 " | Ping: " $4 "ms | Speed: " $5/1024 "KB/s"}' || echo "None")
+          
+          Top Other Servers:
+          $(head -10 quality_other.txt 2>/dev/null | awk -F'|' '{print "Score: " $1 " | " $2 " | Ping: " $4 "ms | Speed: " $5/1024 "KB/s"}' || echo "None")
+          EOF
           
           # Генерация white-list.txt
           {
@@ -331,13 +362,16 @@ jobs:
             echo "# servers: $FINAL_COUNT"
             echo "# total_links: $TOTAL_LINKS"
             echo "# Hysteria servers: $HYSTERIA_COUNT total"
-            echo "# Russia: $RUSSIA_USED (of $RUSSIA_COUNT) | Other: $OTHER_USED (of $OTHER_COUNT)"
+            echo "# Russia: $RUSSIA_USED (of $RUSSIA_COUNT quality) | Other: $OTHER_USED (of $OTHER_COUNT quality)"
             echo ""
             
             COUNT=1
             while IFS= read -r link; do
               [ -z "$link" ] && continue
-              echo "📱LTE Обход #$COUNT"
+              # Попытка получить рейтинг для отображения
+              QUALITY=$(grep -F "|$link|" server_quality_sorted.txt 2>/dev/null | cut -d'|' -f1 || echo "?")
+              PING=$(grep -F "|$link|" server_quality_sorted.txt 2>/dev/null | cut -d'|' -f4 || echo "?")
+              echo "📱LTE Обход #$COUNT [Q:$QUALITY|P:${PING}ms]"
               echo "$link"
               ((COUNT++))
             done < selected.txt
@@ -368,12 +402,13 @@ jobs:
             <div class="stats">
               <div class="stat-item"><strong>Total servers:</strong> $FINAL_COUNT</div>
               <div class="stat-item"><strong>Hysteria servers:</strong> $HYSTERIA_COUNT</div>
-              <div class="stat-item"><strong>Russia:</strong> $RUSSIA_USED (of $RUSSIA_COUNT working)</div>
-              <div class="stat-item"><strong>Other:</strong> $OTHER_USED (of $OTHER_COUNT working)</div>
+              <div class="stat-item"><strong>Russia:</strong> $RUSSIA_USED (of $RUSSIA_COUNT quality)</div>
+              <div class="stat-item"><strong>Other:</strong> $OTHER_USED (of $OTHER_COUNT quality)</div>
               <div class="stat-item"><strong>Total links:</strong> $TOTAL_LINKS</div>
             </div>
             <p><a href="white-list.txt">📥 Download subscription (white-list.txt)</a></p>
             <p><a href="android.txt">📱 Download android.txt</a></p>
+            <p><a href="quality_report.txt">📊 Quality Report</a></p>
             <p><a href="meta.json">📊 Metadata</a></p>
           </body>
           </html>
@@ -387,8 +422,8 @@ jobs:
             "total_servers": $FINAL_COUNT,
             "total_links": $TOTAL_LINKS,
             "hysteria_total": $HYSTERIA_COUNT,
-            "russia_working": $RUSSIA_COUNT,
-            "other_working": $OTHER_COUNT,
+            "russia_quality": $RUSSIA_COUNT,
+            "other_quality": $OTHER_COUNT,
             "russia_used": $RUSSIA_USED,
             "other_used": $OTHER_USED,
             "upload": $UPLOAD,
@@ -400,7 +435,6 @@ jobs:
           
           echo "Files generated successfully"
           
-          # Проверка результатов
           if [ ! -s public/white-list.txt ]; then
             echo "::error::Generated white-list.txt is empty"
             exit 1
@@ -413,13 +447,11 @@ jobs:
           
           echo "Validating output..."
           
-          # Проверка формата white-list.txt
           if ! head -n 1 public/white-list.txt | grep -q "^# profile-title:"; then
             echo "::error::Invalid white-list.txt format"
             exit 1
           fi
           
-          # Проверка наличия ссылок
           LINK_COUNT=$(grep -c "^vless://" public/white-list.txt || echo 0)
           if [ "$LINK_COUNT" -eq 0 ]; then
             echo "::error::No VLESS links in white-list.txt"
@@ -446,14 +478,8 @@ jobs:
           ls -la public/ || echo "Public directory not found"
           echo "=== selected.txt ==="
           cat selected.txt 2>/dev/null || echo "File not found"
-          echo "=== working_russia.txt ==="
-          cat working_russia.txt 2>/dev/null || echo "File not found"
-          echo "=== working_other.txt ==="
-          cat working_other.txt 2>/dev/null || echo "File not found"
-          echo "=== server_status.txt ==="
-          head -20 server_status.txt 2>/dev/null || echo "File not found"
-          echo "=== unique.txt count ==="
-          wc -l unique.txt 2>/dev/null || echo "File not found"
+          echo "=== server_quality_sorted.txt (top 10) ==="
+          head -10 server_quality_sorted.txt 2>/dev/null || echo "File not found"
 
   deploy:
     needs: build
