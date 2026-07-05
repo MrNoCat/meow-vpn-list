@@ -15,8 +15,9 @@ env:
   MAX_SERVERS: 5
   RUSSIA_SERVERS: 3
   OTHER_SERVERS: 2
-  TIMEOUT: 5
-  PARALLEL_CHECKS: 10
+  TIMEOUT: 3
+  PARALLEL_CHECKS: 20
+  MAX_CHECK_SERVERS: 200
 
 jobs:
   build:
@@ -36,16 +37,17 @@ jobs:
           set -e
           mkdir -p public
           
+          echo "Downloading config from ${{ env.CONFIG_URL }}"
           if ! curl -fLsS --connect-timeout 10 --max-time 30 \
             "${{ env.CONFIG_URL }}" -o all.txt; then
+            echo "::error::Failed to download config"
             echo "status=error" >> $GITHUB_OUTPUT
-            echo "message=Failed to download config" >> $GITHUB_OUTPUT
             exit 1
           fi
           
           if [ ! -s all.txt ]; then
+            echo "::error::Config file is empty"
             echo "status=error" >> $GITHUB_OUTPUT
-            echo "message=Config file is empty" >> $GITHUB_OUTPUT
             exit 1
           fi
           
@@ -53,20 +55,26 @@ jobs:
 
       - name: Get traffic stats
         id: traffic
-        if: env.API_URL != ''
+        if: secrets.API_URL != '' && secrets.API_KEY != ''
         run: |
           set -e
           API_URL="${{ secrets.API_URL }}"
           API_KEY="${{ secrets.API_KEY }}"
           
-          if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
+          echo "Fetching traffic stats..."
+          
+          # Безопасный запрос с проверкой ответа
+          RESPONSE=$(curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$API_URL" 2>/dev/null) || {
+            echo "::warning::Failed to get traffic stats"
             echo "upload=0" >> $GITHUB_OUTPUT
             echo "download=0" >> $GITHUB_OUTPUT
             echo "total=0" >> $GITHUB_OUTPUT
             exit 0
-          fi
+          }
           
-          if ! RESPONSE=$(curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$API_URL" 2>/dev/null); then
+          # Проверка валидности JSON
+          if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+            echo "::warning::Invalid JSON response from API"
             echo "upload=0" >> $GITHUB_OUTPUT
             echo "download=0" >> $GITHUB_OUTPUT
             echo "total=0" >> $GITHUB_OUTPUT
@@ -86,135 +94,203 @@ jobs:
         run: |
           set -e
           
-          # Extract and clean VLESS links
+          echo "Extracting VLESS links..."
+          
+          # Извлечение и очистка VLESS ссылок
           tr -d '\r' < all.txt | \
             grep -aEo 'vless://[^[:space:]]+' | \
             awk '!seen[$0]++' > unique.txt
           
           if [ ! -s unique.txt ]; then
+            echo "::error::No VLESS links found"
             echo "error=No VLESS links found" >> $GITHUB_OUTPUT
             exit 1
           fi
           
+          # Фильтрация подозрительных доменов
+          grep -vE '(example\.com|test\.com|localhost|127\.0\.0\.1)' unique.txt > filtered.txt
+          mv filtered.txt unique.txt
+          
           TOTAL_LINKS=$(wc -l < unique.txt)
           echo "total_links=$TOTAL_LINKS" >> $GITHUB_OUTPUT
+          echo "Found $TOTAL_LINKS VLESS links"
 
       - name: Detect hysteria servers
         id: hysteria
         run: |
           set -e
           
-          # More robust hysteria detection
+          echo "Detecting hysteria servers..."
+          
+          # Очистка и декодирование URL для поиска
           > hysteria_servers.txt
           
-          # Method 1: Check host/sni parameters
-          grep -E '(host|sni)=([^&]+)' unique.txt | while IFS= read -r link; do
-            if [[ $link =~ (host|sni)=([^&]+) ]]; then
+          # Функция декодирования URL
+          url_decode() {
+            echo "$1" | sed 's/+/ /g; s/%/\\x/g' | xargs -0 printf '%b'
+          }
+          
+          # Проверка параметров host/sni
+          while IFS= read -r link; do
+            if [[ $link =~ [&\?](host|sni)=([^&]+) ]]; then
               VALUE="${BASH_REMATCH[2]}"
-              # URL decode and check for hysteria
-              DECODED=$(printf '%b' "${VALUE//%/\\x}" 2>/dev/null || echo "$VALUE")
+              DECODED=$(url_decode "$VALUE" 2>/dev/null || echo "$VALUE")
               if echo "$DECODED" | grep -qi "hysteria"; then
                 echo "$link" >> hysteria_servers.txt
+                continue
               fi
             fi
-          done
+            
+            # Проверка наличия hysteria в URL
+            if echo "$link" | grep -qi "hysteria"; then
+              echo "$link" >> hysteria_servers.txt
+              continue
+            fi
+          done < unique.txt
           
-          # Method 2: Check for .hysteria. in URL
+          # Если не найдено hysteria - используем все ссылки
           if [ ! -s hysteria_servers.txt ]; then
-            grep -i "\.hysteria\." unique.txt > hysteria_servers.txt || true
-          fi
-          
-          # Method 3: Check for hysteria in any part
-          if [ ! -s hysteria_servers.txt ]; then
-            grep -i "hysteria" unique.txt > hysteria_servers.txt || true
-          fi
-          
-          # If no hysteria, use all links
-          if [ ! -s hysteria_servers.txt ]; then
+            echo "::warning::No hysteria servers found, using all links"
             cp unique.txt hysteria_servers.txt
-            echo "warning=No hysteria found, using all" >> $GITHUB_OUTPUT
           fi
           
           HYSTERIA_COUNT=$(wc -l < hysteria_servers.txt)
           echo "hysteria_count=$HYSTERIA_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $HYSTERIA_COUNT hysteria servers"
 
       - name: Check server availability
         id: check
         run: |
           set -e
           
-          # Function to check server
+          echo "Checking server availability..."
+          
+          # Кеш для геолокации
+          declare -A IP_CACHE
+          
+          # Функция получения страны с кешированием
+          get_country() {
+            local ip="$1"
+            
+            # Проверка кеша
+            if [[ -n "${IP_CACHE[$ip]}" ]]; then
+              echo "${IP_CACHE[$ip]}"
+              return
+            fi
+            
+            # Запрос к API с таймаутом
+            local country
+            country=$(curl -s --max-time 2 "http://ip-api.com/line/$ip?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
+            
+            # Кеширование результата
+            IP_CACHE[$ip]="$country"
+            echo "$country"
+          }
+          export -f get_country
+          
+          # Функция проверки сервера
           check_server() {
             local link="$1"
             local host port
             
-            # Extract host and port
+            # Извлечение хоста и порта
             if [[ $link =~ vless://[^@]+@([^:]+):([0-9]+) ]]; then
               host="${BASH_REMATCH[1]}"
               port="${BASH_REMATCH[2]}"
+            elif [[ $link =~ vless://[^/]+/([^:]+):([0-9]+) ]]; then
+              host="${BASH_REMATCH[1]}"
+              port="${BASH_REMATCH[2]}"
             else
-              host=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f1)
-              port=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f2 | cut -d'/' -f1)
+              # Fallback - извлечение из URL
+              host=$(echo "$link" | sed -n 's/.*vless:\/\/[^@]*@\([^:]*\):.*/\1/p')
+              port=$(echo "$link" | sed -n 's/.*:\([0-9]*\)[^0-9]*$/\1/p')
               [ -z "$port" ] && port="443"
             fi
             
-            # Quick port check
-            if timeout 2 nc -zv "$host" "$port" 2>&1 | grep -q "Connected"; then
-              # Get country
-              country=$(curl -s --max-time 2 "http://ip-api.com/line/$host?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
+            # Валидация
+            if [ -z "$host" ] || [ -z "$port" ]; then
+              return 1
+            fi
+            
+            # Проверка порта с таймаутом
+            if timeout ${{ env.TIMEOUT }} nc -zv "$host" "$port" 2>&1 | grep -q "Connected"; then
+              # Получение страны
+              country=$(get_country "$host")
               echo "$link|$country"
             fi
           }
-          
           export -f check_server
           
-          # Check first 100 servers in parallel
-          head -100 hysteria_servers.txt | \
+          # Проверка серверов с лимитом
+          TOTAL_HYSTERIA=$(wc -l < hysteria_servers.txt)
+          CHECK_COUNT=$((TOTAL_HYSTERIA < ${{ env.MAX_CHECK_SERVERS }} ? TOTAL_HYSTERIA : ${{ env.MAX_CHECK_SERVERS }}))
+          
+          echo "Checking first $CHECK_COUNT servers..."
+          head -"$CHECK_COUNT" hysteria_servers.txt | \
             parallel -j ${{ env.PARALLEL_CHECKS }} check_server {} > server_status.txt || true
           
-          # Parse results
+          # Парсинг результатов
           grep -E '\|RU$' server_status.txt | cut -d'|' -f1 > working_russia.txt || true
-          grep -E '\|(US|DE|FR|GB|NL|CA|AU|SG|JP|KR)$' server_status.txt | cut -d'|' -f1 > working_other.txt || true
+          grep -E '\|(US|DE|FR|GB|NL|CA|AU|SG|JP|KR|IT|ES|SE|NO|FI|DK|BE|CH|AT|NZ|HK|TW|IN|BR|MX|ZA|AE|IL)$' server_status.txt | cut -d'|' -f1 > working_other.txt || true
           
           RUSSIA_COUNT=$(wc -l < working_russia.txt 2>/dev/null || echo 0)
           OTHER_COUNT=$(wc -l < working_other.txt 2>/dev/null || echo 0)
           
           echo "russia_count=$RUSSIA_COUNT" >> $GITHUB_OUTPUT
           echo "other_count=$OTHER_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $RUSSIA_COUNT working Russia servers, $OTHER_COUNT working other servers"
 
       - name: Select best servers
         id: select
         run: |
           set -e
           
+          echo "Selecting best servers..."
+          
           > selected.txt
           
-          # Select Russia servers
-          if [ -s working_russia.txt ]; then
-            head -${{ env.RUSSIA_SERVERS }} working_russia.txt >> selected.txt
-          fi
+          # Функция безопасного добавления серверов
+          add_servers() {
+            local source="$1"
+            local count="$2"
+            
+            if [ -s "$source" ] && [ "$count" -gt 0 ]; then
+              head -"$count" "$source" >> selected.txt
+            fi
+          }
           
-          # Select other servers
-          if [ -s working_other.txt ]; then
-            head -${{ env.OTHER_SERVERS }} working_other.txt >> selected.txt
-          fi
+          # Выбор Russia серверов
+          add_servers working_russia.txt ${{ env.RUSSIA_SERVERS }}
           
-          # Fallback to non-checked servers if needed
+          # Выбор других серверов
+          add_servers working_other.txt ${{ env.OTHER_SERVERS }}
+          
+          # Проверка дубликатов
+          sort -u selected.txt > selected_unique.txt
+          mv selected_unique.txt selected.txt
+          
+          # Fallback если мало серверов
           SELECTED_COUNT=$(wc -l < selected.txt 2>/dev/null || echo 0)
           NEEDED=$(( ${{ env.MAX_SERVERS }} - SELECTED_COUNT ))
           
           if [ "$NEEDED" -gt 0 ] && [ -s hysteria_servers.txt ]; then
-            # Get servers not already selected
-            grep -Fvxf selected.txt hysteria_servers.txt | head -"$NEEDED" >> selected.txt
+            echo "Need $NEEDED more servers, adding fallback..."
+            
+            # Добавляем серверы, которых нет в выбранных
+            grep -Fvxf selected.txt hysteria_servers.txt | \
+              head -"$NEEDED" >> selected.txt || true
           fi
           
-          # Final cleanup and limit
+          # Финальная очистка и лимит
           sed -i '/^$/d' selected.txt
+          sort -u selected.txt > selected_unique.txt
+          mv selected_unique.txt selected.txt
           head -${{ env.MAX_SERVERS }} selected.txt > temp.txt
           mv temp.txt selected.txt
           
           FINAL_COUNT=$(wc -l < selected.txt)
           echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
+          echo "Selected $FINAL_COUNT servers"
 
       - name: Generate output files
         id: generate
@@ -222,47 +298,60 @@ jobs:
           set -e
           export TZ=Europe/Moscow
           
-          # Get traffic stats
+          # Получение статистики трафика
           UPLOAD="${{ steps.traffic.outputs.upload || 0 }}"
           DOWNLOAD="${{ steps.traffic.outputs.download || 0 }}"
           TOTAL="${{ steps.traffic.outputs.total || 0 }}"
           
-          # Get counts
+          # Получение счетчиков
           FINAL_COUNT="${{ steps.select.outputs.final_count || 0 }}"
           HYSTERIA_COUNT="${{ steps.hysteria.outputs.hysteria_count || 0 }}"
           RUSSIA_COUNT="${{ steps.check.outputs.russia_count || 0 }}"
           OTHER_COUNT="${{ steps.check.outputs.other_count || 0 }}"
+          TOTAL_LINKS="${{ steps.extract.outputs.total_links || 0 }}"
           
-          # Calculate actual used
-          RUSSIA_USED=$(grep -Ff working_russia.txt selected.txt 2>/dev/null | wc -l || echo 0)
-          OTHER_USED=$(grep -Ff working_other.txt selected.txt 2>/dev/null | wc -l || echo 0)
+          # Расчет используемых серверов
+          RUSSIA_USED=0
+          OTHER_USED=0
+          
+          if [ -s working_russia.txt ] && [ -s selected.txt ]; then
+            RUSSIA_USED=$(grep -Ff working_russia.txt selected.txt 2>/dev/null | wc -l || echo 0)
+          fi
+          
+          if [ -s working_other.txt ] && [ -s selected.txt ]; then
+            OTHER_USED=$(grep -Ff working_other.txt selected.txt 2>/dev/null | wc -l || echo 0)
+          fi
           
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
           
-          # Generate white-list.txt
+          echo "Generating output files..."
+          
+          # Генерация white-list.txt
           {
             echo "# profile-title: @meowmeres 🏳️HYSTERIA LISTS🏳️"
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
             echo "# servers: $FINAL_COUNT"
+            echo "# total_links: $TOTAL_LINKS"
             echo "# Hysteria servers: $HYSTERIA_COUNT total"
             echo "# Russia: $RUSSIA_USED (of $RUSSIA_COUNT) | Other: $OTHER_USED (of $OTHER_COUNT)"
             echo ""
             
             COUNT=1
             while IFS= read -r link; do
+              [ -z "$link" ] && continue
               echo "📱LTE Обход #$COUNT"
               echo "$link"
               ((COUNT++))
             done < selected.txt
           } > public/white-list.txt
           
-          # Generate android.txt (just links)
+          # Генерация android.txt (только ссылки)
           cat selected.txt > public/android.txt
           
-          # Generate index.html
+          # Генерация index.html
           cat > public/index.html << EOF
           <!DOCTYPE html>
           <html>
@@ -270,21 +359,38 @@ jobs:
             <meta charset="UTF-8">
             <meta http-equiv="refresh" content="0; url=white-list.txt">
             <title>Hysteria Lists</title>
+            <style>
+              body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+              h1 { color: #333; }
+              .stats { background: #f5f5f5; padding: 15px; border-radius: 5px; }
+              .stat-item { margin: 5px 0; }
+              a { color: #0066cc; text-decoration: none; }
+              a:hover { text-decoration: underline; }
+            </style>
           </head>
           <body>
-            <h1>✅ Updated: $DATE $TIME</h1>
-            <p>Hysteria: RU $RUSSIA_USED, Other $OTHER_USED</p>
-            <p>Total servers: $FINAL_COUNT</p>
-            <a href="white-list.txt">Download subscription</a>
+            <h1>✅ Hysteria Lists - Updated: $DATE $TIME</h1>
+            <div class="stats">
+              <div class="stat-item"><strong>Total servers:</strong> $FINAL_COUNT</div>
+              <div class="stat-item"><strong>Hysteria servers:</strong> $HYSTERIA_COUNT</div>
+              <div class="stat-item"><strong>Russia:</strong> $RUSSIA_USED (of $RUSSIA_COUNT working)</div>
+              <div class="stat-item"><strong>Other:</strong> $OTHER_USED (of $OTHER_COUNT working)</div>
+              <div class="stat-item"><strong>Total links:</strong> $TOTAL_LINKS</div>
+            </div>
+            <p><a href="white-list.txt">📥 Download subscription (white-list.txt)</a></p>
+            <p><a href="android.txt">📱 Download android.txt</a></p>
+            <p><a href="meta.json">📊 Metadata</a></p>
           </body>
           </html>
           EOF
           
-          # Create a metadata file for debugging
+          # Создание метаданных
           cat > public/meta.json << EOF
           {
             "update": "$DATE $TIME",
+            "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
             "total_servers": $FINAL_COUNT,
+            "total_links": $TOTAL_LINKS,
             "hysteria_total": $HYSTERIA_COUNT,
             "russia_working": $RUSSIA_COUNT,
             "other_working": $OTHER_COUNT,
@@ -292,11 +398,40 @@ jobs:
             "other_used": $OTHER_USED,
             "upload": $UPLOAD,
             "download": $DOWNLOAD,
-            "total": $TOTAL
+            "total": $TOTAL,
+            "max_servers": ${{ env.MAX_SERVERS }}
           }
           EOF
           
-          echo "Generated files successfully"
+          echo "Files generated successfully"
+          
+          # Проверка результатов
+          if [ ! -s public/white-list.txt ]; then
+            echo "::error::Generated white-list.txt is empty"
+            exit 1
+          fi
+
+      - name: Validate output
+        id: validate
+        run: |
+          set -e
+          
+          echo "Validating output..."
+          
+          # Проверка формата white-list.txt
+          if ! head -n 1 public/white-list.txt | grep -q "^# profile-title:"; then
+            echo "::error::Invalid white-list.txt format"
+            exit 1
+          fi
+          
+          # Проверка наличия ссылок
+          LINK_COUNT=$(grep -c "^vless://" public/white-list.txt || echo 0)
+          if [ "$LINK_COUNT" -eq 0 ]; then
+            echo "::error::No VLESS links in white-list.txt"
+            exit 1
+          fi
+          
+          echo "Validated: $LINK_COUNT links in white-list.txt"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -312,13 +447,18 @@ jobs:
         if: failure()
         run: |
           echo "=== Debug Info ==="
-          ls -la public/ || true
+          echo "Directory contents:"
+          ls -la public/ || echo "Public directory not found"
           echo "=== selected.txt ==="
           cat selected.txt 2>/dev/null || echo "File not found"
           echo "=== working_russia.txt ==="
           cat working_russia.txt 2>/dev/null || echo "File not found"
           echo "=== working_other.txt ==="
           cat working_other.txt 2>/dev/null || echo "File not found"
+          echo "=== server_status.txt ==="
+          head -20 server_status.txt 2>/dev/null || echo "File not found"
+          echo "=== unique.txt count ==="
+          wc -l unique.txt 2>/dev/null || echo "File not found"
 
   deploy:
     needs: build
