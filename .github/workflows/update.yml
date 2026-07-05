@@ -55,11 +55,19 @@ jobs:
 
       - name: Get traffic stats
         id: traffic
-        if: secrets.API_URL != '' && secrets.API_KEY != ''
         run: |
           set -e
           API_URL="${{ secrets.API_URL }}"
           API_KEY="${{ secrets.API_KEY }}"
+          
+          # Пропускаем если нет API данных
+          if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
+            echo "::warning::API credentials not configured, skipping traffic stats"
+            echo "upload=0" >> $GITHUB_OUTPUT
+            echo "download=0" >> $GITHUB_OUTPUT
+            echo "total=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
           echo "Fetching traffic stats..."
           
