@@ -130,37 +130,24 @@ jobs:
           
           echo "Detecting hysteria servers..."
           
-          # Очистка и декодирование URL для поиска
-          > hysteria_servers.txt
+          # Поиск hysteria серверов
+          # Метод 1: Поиск в параметрах host/sni
+          grep -E '\?(.*&)?(host|sni)=[^&]*hysteria' unique.txt > hysteria_temp1.txt 2>/dev/null || true
           
-          # Функция декодирования URL
-          url_decode() {
-            echo "$1" | sed 's/+/ /g; s/%/\\x/g' | xargs -0 printf '%b'
-          }
+          # Метод 2: Поиск в самом URL
+          grep -i "hysteria" unique.txt > hysteria_temp2.txt 2>/dev/null || true
           
-          # Проверка параметров host/sni
-          while IFS= read -r link; do
-            if [[ $link =~ [&\?](host|sni)=([^&]+) ]]; then
-              VALUE="${BASH_REMATCH[2]}"
-              DECODED=$(url_decode "$VALUE" 2>/dev/null || echo "$VALUE")
-              if echo "$DECODED" | grep -qi "hysteria"; then
-                echo "$link" >> hysteria_servers.txt
-                continue
-              fi
-            fi
-            
-            # Проверка наличия hysteria в URL
-            if echo "$link" | grep -qi "hysteria"; then
-              echo "$link" >> hysteria_servers.txt
-              continue
-            fi
-          done < unique.txt
+          # Объединение и удаление дубликатов
+          cat hysteria_temp1.txt hysteria_temp2.txt | sort -u > hysteria_servers.txt 2>/dev/null || true
           
           # Если не найдено hysteria - используем все ссылки
           if [ ! -s hysteria_servers.txt ]; then
             echo "::warning::No hysteria servers found, using all links"
             cp unique.txt hysteria_servers.txt
           fi
+          
+          # Очистка временных файлов
+          rm -f hysteria_temp1.txt hysteria_temp2.txt
           
           HYSTERIA_COUNT=$(wc -l < hysteria_servers.txt)
           echo "hysteria_count=$HYSTERIA_COUNT" >> $GITHUB_OUTPUT
