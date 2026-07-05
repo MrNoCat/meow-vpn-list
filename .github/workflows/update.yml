@@ -11,14 +11,12 @@ permissions:
   contents: read
 
 env:
-  MAX_SERVERS_TO_TEST: 100
-  RUSSIA_LIMIT: 3
-  OTHER_LIMIT: 2
-  TOTAL_LIMIT: 5
-  TIMEOUT: 3
-  CONCURRENT_CHECKS: 10
-  RETRY_ATTEMPTS: 3
-  RETRY_DELAY: 2
+  CONFIG_URL: "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt"
+  MAX_SERVERS: 5
+  RUSSIA_SERVERS: 3
+  OTHER_SERVERS: 2
+  TIMEOUT: 5
+  PARALLEL_CHECKS: 10
 
 jobs:
   build:
@@ -26,30 +24,54 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Install dependencies
+      - name: Setup environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq parallel curl
+          sudo apt-get install -y parallel jq netcat-openbsd
+          echo "TZ=Europe/Moscow" >> $GITHUB_ENV
 
-      - name: Download config
+      - name: Download and validate config
+        id: download
         run: |
-          curl -fLsS --connect-timeout 10 --max-time 30 \
-            https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt \
-            -o all.txt || { echo "[]" > all.txt; exit 0; }
+          set -e
+          mkdir -p public
+          
+          if ! curl -fLsS --connect-timeout 10 --max-time 30 \
+            "${{ env.CONFIG_URL }}" -o all.txt; then
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "message=Failed to download config" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          if [ ! -s all.txt ]; then
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "message=Config file is empty" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "status=success" >> $GITHUB_OUTPUT
 
       - name: Get traffic stats
         id: traffic
+        if: env.API_URL != ''
         run: |
-          if [ -z "${{ secrets.API_URL }}" ] || [ -z "${{ secrets.API_KEY }}" ]; then
+          set -e
+          API_URL="${{ secrets.API_URL }}"
+          API_KEY="${{ secrets.API_KEY }}"
+          
+          if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
             echo "upload=0" >> $GITHUB_OUTPUT
             echo "download=0" >> $GITHUB_OUTPUT
             echo "total=0" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          RESPONSE=$(curl -s --max-time 5 \
-            -H "Authorization: Bearer ${{ secrets.API_KEY }}" \
-            "${{ secrets.API_URL }}" 2>/dev/null || echo '{"upload":0,"download":0}')
+          if ! RESPONSE=$(curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$API_URL" 2>/dev/null); then
+            echo "upload=0" >> $GITHUB_OUTPUT
+            echo "download=0" >> $GITHUB_OUTPUT
+            echo "total=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
           UPLOAD=$(echo "$RESPONSE" | jq -r '.upload // 0')
           DOWNLOAD=$(echo "$RESPONSE" | jq -r '.download // 0')
@@ -59,523 +81,222 @@ jobs:
           echo "download=$DOWNLOAD" >> $GITHUB_OUTPUT
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
 
-      - name: Build hysteria list
-        id: build
+      - name: Extract and filter VLESS links
+        id: extract
         run: |
           set -e
-          export TZ=Europe/Moscow
-          mkdir -p public /tmp/server_check
           
-          # Validate input
-          if [ ! -s all.txt ]; then
-            echo "NO DATA" > public/white-list.txt
-            echo "NO DATA" > public/android.txt
-            echo "NO DATA" > public/index.html
-            exit 0
-          fi
-          
-          # Clean and extract vless links with proper validation
+          # Extract and clean VLESS links
           tr -d '\r' < all.txt | \
-            grep -aEo 'vless://[a-zA-Z0-9+/=._-]+@[^[:space:]]+' | \
-            sort -u > links.txt
+            grep -aEo 'vless://[^[:space:]]+' | \
+            awk '!seen[$0]++' > unique.txt
           
-          if [ ! -s links.txt ]; then
-            echo "NO VLESS LINKS FOUND" > public/white-list.txt
-            echo "NO VLESS LINKS FOUND" > public/android.txt
-            echo "NO VLESS LINKS FOUND" > public/index.html
-            exit 0
+          if [ ! -s unique.txt ]; then
+            echo "error=No VLESS links found" >> $GITHUB_OUTPUT
+            exit 1
           fi
           
-          # ========== UTILITY FUNCTIONS ==========
+          TOTAL_LINKS=$(wc -l < unique.txt)
+          echo "total_links=$TOTAL_LINKS" >> $GITHUB_OUTPUT
+
+      - name: Detect hysteria servers
+        id: hysteria
+        run: |
+          set -e
           
-          # Safe URL decoding
-          url_decode() {
-            local encoded="$1"
-            printf '%b' "${encoded//%/\\x}" 2>/dev/null || echo "$encoded"
-          }
-          
-          # Safe vless URL parsing
-          parse_vless_url() {
-            local url="$1"
-            local host=""
-            local port="443"
-            
-            # Extract host:port from vless URL
-            if [[ "$url" =~ vless://([^@]+)@([^:]+):([0-9]+)(.*) ]]; then
-              host="${BASH_REMATCH[2]}"
-              port="${BASH_REMATCH[3]}"
-            else
-              # Fallback: try alternative pattern
-              local url_part=$(echo "$url" | sed -n 's/.*vless:\/\/[^@]*@\([^?]*\).*/\1/p')
-              if [[ "$url_part" =~ ^([^:]+):([0-9]+) ]]; then
-                host="${BASH_REMATCH[1]}"
-                port="${BASH_REMATCH[2]}"
-              else
-                return 1
-              fi
-            fi
-            
-            # Validate hostname/IP
-            if [[ ! "$host" =~ ^[a-zA-Z0-9._-]+$ ]] && [[ ! "$host" =~ ^[0-9.]+$ ]] && [[ ! "$host" =~ ^[0-9a-fA-F:]+$ ]]; then
-              return 1
-            fi
-            
-            # Validate port
-            if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-              port=443
-            fi
-            
-            echo "$host:$port"
-            return 0
-          }
-          
-          # Check if server is hysteria by analyzing parameters
-          is_hysteria_server() {
-            local url="$1"
-            local decoded_url
-            decoded_url=$(url_decode "$url")
-            
-            # Check multiple indicators
-            if echo "$decoded_url" | grep -qi "hysteria"; then
-              return 0
-            fi
-            
-            # Check for typical hysteria parameters
-            if [[ "$decoded_url" =~ (obfs|protocol)=hysteria ]] || \
-               [[ "$decoded_url" =~ (upMbps|downMbps)=[0-9]+ ]]; then
-              return 0
-            fi
-            
-            # Check for hysteria in domain
-            if echo "$decoded_url" | grep -qi "\.hysteria\."; then
-              return 0
-            fi
-            
-            return 1
-          }
-          
-          # Safe IP validation
-          validate_ip() {
-            local ip="$1"
-            # IPv4
-            if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              IFS='.' read -r a b c d <<< "$ip"
-              [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ]
-              return $?
-            fi
-            # Domain
-            if [[ "$ip" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-              return 0
-            fi
-            return 1
-          }
-          
-          # Test server with retry
-          test_server() {
-            local link="$1"
-            local output_file="$2"
-            local max_retries="${RETRY_ATTEMPTS:-3}"
-            local retry_delay="${RETRY_DELAY:-2}"
-            
-            # Parse URL
-            local host_port
-            if ! host_port=$(parse_vless_url "$link"); then
-              return 1
-            fi
-            
-            local host="${host_port%:*}"
-            local port="${host_port#*:}"
-            
-            # Validate
-            if ! validate_ip "$host"; then
-              return 1
-            fi
-            
-            # Test connectivity with retry
-            local attempt=1
-            while [ $attempt -le $max_retries ]; do
-              if timeout "${TIMEOUT}" bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null; then
-                # Get country info with cache
-                local country
-                country=$(get_country "$host")
-                echo "${link}|${country}" >> "$output_file"
-                return 0
-              fi
-              sleep $((attempt * retry_delay))
-              ((attempt++))
-            done
-            return 1
-          }
-          
-          # Country cache
-          declare -A COUNTRY_CACHE
-          get_country() {
-            local ip="$1"
-            
-            # Check cache
-            if [[ -n "${COUNTRY_CACHE[$ip]}" ]]; then
-              echo "${COUNTRY_CACHE[$ip]}"
-              return 0
-            fi
-            
-            # Get country with timeout
-            local country
-            country=$(curl -s --max-time 2 "http://ip-api.com/line/$ip?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
-            
-            # Cache result (even if UNKNOWN)
-            COUNTRY_CACHE[$ip]="$country"
-            echo "$country"
-            return 0
-          }
-          export -f test_server get_country parse_vless_url validate_ip url_decode
-          export TIMEOUT RETRY_ATTEMPTS RETRY_DELAY
-          
-          # ========== MAIN LOGIC ==========
-          
-          # Detect hysteria servers
-          echo "🔍 Detecting hysteria servers..."
+          # More robust hysteria detection
           > hysteria_servers.txt
           
-          while IFS= read -r link; do
-            if is_hysteria_server "$link"; then
-              echo "$link" >> hysteria_servers.txt
+          # Method 1: Check host/sni parameters
+          grep -E '(host|sni)=([^&]+)' unique.txt | while IFS= read -r link; do
+            if [[ $link =~ (host|sni)=([^&]+) ]]; then
+              VALUE="${BASH_REMATCH[2]}"
+              # URL decode and check for hysteria
+              DECODED=$(printf '%b' "${VALUE//%/\\x}" 2>/dev/null || echo "$VALUE")
+              if echo "$DECODED" | grep -qi "hysteria"; then
+                echo "$link" >> hysteria_servers.txt
+              fi
             fi
-          done < links.txt
+          done
           
-          # Fallback: if no hysteria servers, use all
+          # Method 2: Check for .hysteria. in URL
           if [ ! -s hysteria_servers.txt ]; then
-            echo "⚠️ No hysteria servers found, using all servers"
-            cp links.txt hysteria_servers.txt
+            grep -i "\.hysteria\." unique.txt > hysteria_servers.txt || true
+          fi
+          
+          # Method 3: Check for hysteria in any part
+          if [ ! -s hysteria_servers.txt ]; then
+            grep -i "hysteria" unique.txt > hysteria_servers.txt || true
+          fi
+          
+          # If no hysteria, use all links
+          if [ ! -s hysteria_servers.txt ]; then
+            cp unique.txt hysteria_servers.txt
+            echo "warning=No hysteria found, using all" >> $GITHUB_OUTPUT
           fi
           
           HYSTERIA_COUNT=$(wc -l < hysteria_servers.txt)
-          echo "✅ Found $HYSTERIA_COUNT potential hysteria servers"
+          echo "hysteria_count=$HYSTERIA_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Check server availability
+        id: check
+        run: |
+          set -e
           
-          # Limit servers for testing
-          head -"${MAX_SERVERS_TO_TEST}" hysteria_servers.txt > /tmp/server_check/servers_to_test.txt
+          # Function to check server
+          check_server() {
+            local link="$1"
+            local host port
+            
+            # Extract host and port
+            if [[ $link =~ vless://[^@]+@([^:]+):([0-9]+) ]]; then
+              host="${BASH_REMATCH[1]}"
+              port="${BASH_REMATCH[2]}"
+            else
+              host=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f1)
+              port=$(echo "$link" | grep -oE '://[^/]+' | sed 's/:\/\///' | cut -d':' -f2 | cut -d'/' -f1)
+              [ -z "$port" ] && port="443"
+            fi
+            
+            # Quick port check
+            if timeout 2 nc -zv "$host" "$port" 2>&1 | grep -q "Connected"; then
+              # Get country
+              country=$(curl -s --max-time 2 "http://ip-api.com/line/$host?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
+              echo "$link|$country"
+            fi
+          }
           
-          # Test servers in parallel with safe xargs
-          echo "🧪 Testing server availability (concurrent: ${CONCURRENT_CHECKS})..."
-          > /tmp/server_check/results.txt
+          export -f check_server
           
-          # Safe parallel execution with proper escaping
-          cat /tmp/server_check/servers_to_test.txt | \
-            xargs -P "${CONCURRENT_CHECKS}" -I {} \
-            bash -c 'test_server "$1" "/tmp/server_check/results.txt"' _ {}
+          # Check first 100 servers in parallel
+          head -100 hysteria_servers.txt | \
+            parallel -j ${{ env.PARALLEL_CHECKS }} check_server {} > server_status.txt || true
           
           # Parse results
-          > working_russia.txt
-          > working_other.txt
+          grep -E '\|RU$' server_status.txt | cut -d'|' -f1 > working_russia.txt || true
+          grep -E '\|(US|DE|FR|GB|NL|CA|AU|SG|JP|KR)$' server_status.txt | cut -d'|' -f1 > working_other.txt || true
           
-          if [ -s /tmp/server_check/results.txt ]; then
-            while IFS='|' read -r link country; do
-              # Sanitize input
-              link=$(echo "$link" | tr -d '\r\n')
-              country=$(echo "$country" | tr -d '\r\n' | tr '[:lower:]' '[:upper:]')
-              
-              if [ "$country" = "RU" ]; then
-                echo "$link" >> working_russia.txt
-              elif [ "$country" != "UNKNOWN" ] && [ -n "$country" ]; then
-                echo "$link" >> working_other.txt
-              fi
-            done < /tmp/server_check/results.txt
-          fi
+          RUSSIA_COUNT=$(wc -l < working_russia.txt 2>/dev/null || echo 0)
+          OTHER_COUNT=$(wc -l < working_other.txt 2>/dev/null || echo 0)
           
-          RUSSIA_COUNT=$(wc -l < working_russia.txt 2>/dev/null | tr -d ' ')
-          OTHER_COUNT=$(wc -l < working_other.txt 2>/dev/null | tr -d ' ')
-          
-          echo "✅ Working hysteria servers - Russia: $RUSSIA_COUNT, Other: $OTHER_COUNT"
-          
-          # ========== SELECT SERVERS ==========
+          echo "russia_count=$RUSSIA_COUNT" >> $GITHUB_OUTPUT
+          echo "other_count=$OTHER_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Select best servers
+        id: select
+        run: |
+          set -e
           
           > selected.txt
           
-          # Function to add servers with limit
-          add_servers() {
-            local source_file="$1"
-            local limit="$2"
-            local count=0
-            
-            if [ ! -s "$source_file" ]; then
-              return 0
-            fi
-            
-            while IFS= read -r server; do
-              if [ $count -ge "$limit" ]; then
-                break
-              fi
-              echo "$server" >> selected.txt
-              ((count++))
-            done < "$source_file"
-            
-            echo "$count"
-          }
-          
           # Select Russia servers
-          RUSSIA_ADDED=$(add_servers working_russia.txt "$RUSSIA_LIMIT")
+          if [ -s working_russia.txt ]; then
+            head -${{ env.RUSSIA_SERVERS }} working_russia.txt >> selected.txt
+          fi
           
           # Select other servers
-          OTHER_ADDED=$(add_servers working_other.txt "$OTHER_LIMIT")
-          
-          # If not enough, add fallback servers
-          SELECTED_COUNT=$(wc -l < selected.txt 2>/dev/null | tr -d ' ')
-          if [ "$SELECTED_COUNT" -lt "$TOTAL_LIMIT" ]; then
-            echo "⚠️ Not enough working servers ($SELECTED_COUNT/$TOTAL_LIMIT), adding fallback..."
-            
-            local needed=$((TOTAL_LIMIT - SELECTED_COUNT))
-            local fallback_count=0
-            
-            tail -n +$((MAX_SERVERS_TO_TEST + 1)) hysteria_servers.txt | \
-              head -50 | \
-              while IFS= read -r link; do
-                if [ $fallback_count -ge $needed ]; then
-                  break
-                fi
-                echo "$link" >> selected.txt
-                ((fallback_count++))
-              done
+          if [ -s working_other.txt ]; then
+            head -${{ env.OTHER_SERVERS }} working_other.txt >> selected.txt
           fi
           
-          # Final fallback: if still no servers
-          if [ ! -s selected.txt ]; then
-            echo "⚠️ No working servers, using first $TOTAL_LIMIT servers"
-            head -"$TOTAL_LIMIT" hysteria_servers.txt > selected.txt
+          # Fallback to non-checked servers if needed
+          SELECTED_COUNT=$(wc -l < selected.txt 2>/dev/null || echo 0)
+          NEEDED=$(( ${{ env.MAX_SERVERS }} - SELECTED_COUNT ))
+          
+          if [ "$NEEDED" -gt 0 ] && [ -s hysteria_servers.txt ]; then
+            # Get servers not already selected
+            grep -Fvxf selected.txt hysteria_servers.txt | head -"$NEEDED" >> selected.txt
           fi
           
-          # Clean and limit
-          sed -i '/^[[:space:]]*$/d' selected.txt
-          head -"$TOTAL_LIMIT" selected.txt > temp.txt
+          # Final cleanup and limit
+          sed -i '/^$/d' selected.txt
+          head -${{ env.MAX_SERVERS }} selected.txt > temp.txt
           mv temp.txt selected.txt
           
-          # Count final selection
-          RUSSIA_FINAL=0
-          OTHER_FINAL=0
+          FINAL_COUNT=$(wc -l < selected.txt)
+          echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Generate output files
+        id: generate
+        run: |
+          set -e
+          export TZ=Europe/Moscow
           
-          if [ -f working_russia.txt ]; then
-            RUSSIA_FINAL=$(grep -Ff working_russia.txt selected.txt 2>/dev/null | wc -l | tr -d ' ')
-          fi
-          if [ -f working_other.txt ]; then
-            OTHER_FINAL=$(grep -Ff working_other.txt selected.txt 2>/dev/null | wc -l | tr -d ' ')
-          fi
+          # Get traffic stats
+          UPLOAD="${{ steps.traffic.outputs.upload || 0 }}"
+          DOWNLOAD="${{ steps.traffic.outputs.download || 0 }}"
+          TOTAL="${{ steps.traffic.outputs.total || 0 }}"
           
-          # ========== GENERATE OUTPUT ==========
+          # Get counts
+          FINAL_COUNT="${{ steps.select.outputs.final_count || 0 }}"
+          HYSTERIA_COUNT="${{ steps.hysteria.outputs.hysteria_count || 0 }}"
+          RUSSIA_COUNT="${{ steps.check.outputs.russia_count || 0 }}"
+          OTHER_COUNT="${{ steps.check.outputs.other_count || 0 }}"
+          
+          # Calculate actual used
+          RUSSIA_USED=$(grep -Ff working_russia.txt selected.txt 2>/dev/null | wc -l || echo 0)
+          OTHER_USED=$(grep -Ff working_other.txt selected.txt 2>/dev/null | wc -l || echo 0)
           
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          COUNT_LINES=$(wc -l < selected.txt | tr -d ' ')
           
-          # Generate white-list.txt with names
-          COUNT=1
-          > final_with_names.txt
-          while IFS= read -r link; do
-            # Sanitize link before output
-            safe_link=$(echo "$link" | sed 's/[&<>]/\\&/g')
-            echo "📱LTE Обход #$COUNT" >> final_with_names.txt
-            echo "$safe_link" >> final_with_names.txt
-            ((COUNT++))
-          done < selected.txt
-          
-          # Get traffic stats
-          UPLOAD="${{ steps.traffic.outputs.upload }}"
-          DOWNLOAD="${{ steps.traffic.outputs.download }}"
-          TOTAL="${{ steps.traffic.outputs.total }}"
-          
-          # Create white-list.txt
+          # Generate white-list.txt
           {
             echo "# profile-title: @meowmeres 🏳️HYSTERIA LISTS🏳️"
             echo "# profile-update-interval: 1"
-            echo "# subscription-userinfo: upload=${UPLOAD:-0}; download=${DOWNLOAD:-0}; total=${TOTAL:-0}; expire=0"
+            echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
-            echo "# servers: $COUNT_LINES"
+            echo "# servers: $FINAL_COUNT"
             echo "# Hysteria servers: $HYSTERIA_COUNT total"
-            echo "# Russia: $RUSSIA_FINAL | Other: $OTHER_FINAL"
+            echo "# Russia: $RUSSIA_USED (of $RUSSIA_COUNT) | Other: $OTHER_USED (of $OTHER_COUNT)"
             echo ""
-            cat final_with_names.txt
+            
+            COUNT=1
+            while IFS= read -r link; do
+              echo "📱LTE Обход #$COUNT"
+              echo "$link"
+              ((COUNT++))
+            done < selected.txt
           } > public/white-list.txt
           
+          # Generate android.txt (just links)
           cat selected.txt > public/android.txt
           
-          # ========== GENERATE HTML ==========
-          
-          # Escape variables for HTML
-          html_escape() {
-            echo "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&#39;/g'
-          }
-          
-          DATE_ESC=$(html_escape "$DATE")
-          TIME_ESC=$(html_escape "$TIME")
-          COUNT_ESC=$(html_escape "$COUNT_LINES")
-          RUSSIA_FINAL_ESC=$(html_escape "$RUSSIA_FINAL")
-          OTHER_FINAL_ESC=$(html_escape "$OTHER_FINAL")
-          HYSTERIA_COUNT_ESC=$(html_escape "$HYSTERIA_COUNT")
-          
+          # Generate index.html
           cat > public/index.html << EOF
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Hysteria Lists Status</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { 
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif;
-      max-width: 600px; 
-      margin: 40px auto; 
-      padding: 20px; 
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-    }
-    .card { 
-      background: rgba(255,255,255,0.95);
-      backdrop-filter: blur(10px);
-      border-radius: 20px; 
-      padding: 32px; 
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-      width: 100%;
-    }
-    h1 { 
-      font-size: 28px; 
-      color: #1a1a2e;
-      margin-bottom: 8px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .badge {
-      background: #22c55e;
-      color: white;
-      font-size: 12px;
-      padding: 2px 12px;
-      border-radius: 20px;
-      font-weight: 600;
-    }
-    .subtitle { 
-      color: #666;
-      margin-bottom: 24px;
-      font-size: 14px;
-    }
-    .stats { 
-      display: grid; 
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      gap: 12px; 
-      margin: 20px 0;
-    }
-    .stat { 
-      background: #f8f9fa;
-      padding: 16px; 
-      border-radius: 12px; 
-      text-align: center;
-      border: 1px solid #e9ecef;
-      transition: transform 0.2s;
-    }
-    .stat:hover {
-      transform: translateY(-2px);
-    }
-    .stat-label { 
-      font-size: 11px; 
-      color: #888;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    .stat-value { 
-      font-size: 24px; 
-      font-weight: 700; 
-      color: #1a1a2e;
-      margin-top: 4px;
-    }
-    .stat-value.russia { color: #ef4444; }
-    .stat-value.other { color: #3b82f6; }
-    .stat-value.total { color: #8b5cf6; }
-    .links {
-      margin: 20px 0;
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .btn {
-      flex: 1;
-      min-width: 120px;
-      padding: 12px 20px;
-      background: #f8f9fa;
-      border: 2px solid #e9ecef;
-      border-radius: 10px;
-      text-align: center;
-      text-decoration: none;
-      color: #1a1a2e;
-      font-weight: 600;
-      font-size: 14px;
-      transition: all 0.2s;
-    }
-    .btn:hover {
-      background: #667eea;
-      border-color: #667eea;
-      color: white;
-      transform: translateY(-2px);
-      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-    }
-    .footer { 
-      margin-top: 20px; 
-      color: #999; 
-      font-size: 13px; 
-      text-align: center;
-      border-top: 1px solid #e9ecef;
-      padding-top: 20px;
-    }
-    .update-time {
-      color: #667eea;
-      font-weight: 600;
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>
-      🚀 Hysteria Lists
-      <span class="badge">LIVE</span>
-    </h1>
-    <p class="subtitle">Last update: <span class="update-time">${DATE_ESC} ${TIME_ESC} (MSK)</span></p>
-    
-    <div class="stats">
-      <div class="stat">
-        <div class="stat-label">Total Servers</div>
-        <div class="stat-value total">${COUNT_ESC}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Russia</div>
-        <div class="stat-value russia">${RUSSIA_FINAL_ESC}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Other</div>
-        <div class="stat-value other">${OTHER_FINAL_ESC}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Hysteria Found</div>
-        <div class="stat-value">${HYSTERIA_COUNT_ESC}</div>
-      </div>
-    </div>
-    
-    <div class="links">
-      <a href="white-list.txt" class="btn">📄 White List</a>
-      <a href="android.txt" class="btn">📱 Android</a>
-    </div>
-    
-    <div class="footer">
-      <p>🔄 Updates every 30 minutes &bull; ⚡ Parallel testing enabled</p>
-      <p style="margin-top: 4px; font-size: 12px; color: #bbb;">Secure • Fast • Reliable</p>
-    </div>
-  </div>
-</body>
-</html>
-EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="UTF-8">
+            <meta http-equiv="refresh" content="0; url=white-list.txt">
+            <title>Hysteria Lists</title>
+          </head>
+          <body>
+            <h1>✅ Updated: $DATE $TIME</h1>
+            <p>Hysteria: RU $RUSSIA_USED, Other $OTHER_USED</p>
+            <p>Total servers: $FINAL_COUNT</p>
+            <a href="white-list.txt">Download subscription</a>
+          </body>
+          </html>
+          EOF
           
-          # Cleanup temporary files
-          rm -f /tmp/server_check/results.txt /tmp/server_check/servers_to_test.txt
-          rm -f links.txt hysteria_servers.txt working_russia.txt working_other.txt final_with_names.txt selected.txt temp.txt
+          # Create a metadata file for debugging
+          cat > public/meta.json << EOF
+          {
+            "update": "$DATE $TIME",
+            "total_servers": $FINAL_COUNT,
+            "hysteria_total": $HYSTERIA_COUNT,
+            "russia_working": $RUSSIA_COUNT,
+            "other_working": $OTHER_COUNT,
+            "russia_used": $RUSSIA_USED,
+            "other_used": $OTHER_USED,
+            "upload": $UPLOAD,
+            "download": $DOWNLOAD,
+            "total": $TOTAL
+          }
+          EOF
           
-          echo "✅ Build completed successfully"
+          echo "Generated files successfully"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -586,6 +307,18 @@ EOF
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
+
+      - name: Debug output
+        if: failure()
+        run: |
+          echo "=== Debug Info ==="
+          ls -la public/ || true
+          echo "=== selected.txt ==="
+          cat selected.txt 2>/dev/null || echo "File not found"
+          echo "=== working_russia.txt ==="
+          cat working_russia.txt 2>/dev/null || echo "File not found"
+          echo "=== working_other.txt ==="
+          cat working_other.txt 2>/dev/null || echo "File not found"
 
   deploy:
     needs: build
