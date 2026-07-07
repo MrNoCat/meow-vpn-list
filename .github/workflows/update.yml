@@ -15,13 +15,14 @@ env:
   MAX_SERVERS: 5             # Гарантированное количество серверов в итоговом файле
   TIMEOUT: 2                 # Таймаут проверки TCP-порта, сек
   PARALLEL_CHECKS: 20        # Параллельных проверок
-  MAX_CHECK_SERVERS: 300     # Сколько серверов реально тестируем за прогон
+  MAX_CHECK_SERVERS: 300     # Сколько серверов реально тестируем за прогон (hysteria)
+  MAX_CHECK_OTHERS: 200      # Сколько НЕ-hysteria серверов тестируем в fallback-е
   PING_COUNT: 3              # Сколько раз пинговать каждый сервер
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    timeout-minutes: 10
 
     steps:
       - name: Setup environment
@@ -136,30 +137,27 @@ jobs:
           grep -E '\?(.*&)?(host|sni)=[^&]*hysteria' unique.txt > hysteria_temp1.txt 2>/dev/null || true
           grep -i "hysteria" unique.txt > hysteria_temp2.txt 2>/dev/null || true
           cat hysteria_temp1.txt hysteria_temp2.txt | sort -u > hysteria_servers.txt 2>/dev/null || true
-
-          # Если hysteria-серверов не нашлось вообще — не оставляем список
-          # пустым, а ищем самые быстрые среди ВСЕХ VLESS-ссылок из
-          # источника. Дальше по пайплайну (проверка скорости, выбор
-          # топ-5) работает точно так же, просто источником становятся
-          # все ссылки, а не только hysteria.
-          if [ ! -s hysteria_servers.txt ]; then
-            echo "::warning::No hysteria servers found, searching fastest among ALL VLESS links instead"
-            cp unique.txt hysteria_servers.txt
-          fi
-
           rm -f hysteria_temp1.txt hysteria_temp2.txt
 
+          # Список "остальных" (не-hysteria) ссылок — нужен для fallback-теста,
+          # если протестированных hysteria-серверов на выходе окажется меньше MAX_SERVERS.
+          if [ -s hysteria_servers.txt ]; then
+            comm -23 <(sort -u unique.txt) <(sort -u hysteria_servers.txt) > other_servers.txt || true
+          else
+            echo "::warning::No hysteria servers found at all"
+            > hysteria_servers.txt
+            sort -u unique.txt > other_servers.txt
+          fi
+
           HYSTERIA_COUNT=$(wc -l < hysteria_servers.txt)
+          OTHER_COUNT=$(wc -l < other_servers.txt)
           echo "hysteria_count=$HYSTERIA_COUNT" >> $GITHUB_OUTPUT
-          echo "Found $HYSTERIA_COUNT hysteria servers"
+          echo "other_count=$OTHER_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $HYSTERIA_COUNT hysteria servers, $OTHER_COUNT other servers"
 
-      - name: Check server quality (ping + port)
-        id: check
+      - name: Prepare check function
         run: |
-          set -e
-
-          echo "Checking server quality..."
-
+          cat > check_server.sh << 'SCRIPT'
           check_server() {
             local link="$1"
             local host port
@@ -211,6 +209,17 @@ jobs:
               echo "999|${link}|n/a"
             fi
           }
+          SCRIPT
+
+          echo "check_server.sh ready"
+
+      - name: Check hysteria server quality (ping + port)
+        id: check
+        run: |
+          set -e
+
+          echo "Checking HYSTERIA server quality..."
+          source check_server.sh
           export -f check_server
           export TIMEOUT PING_COUNT
 
@@ -218,67 +227,108 @@ jobs:
           CHECK_COUNT=$TOTAL_HYSTERIA
           [ "$CHECK_COUNT" -gt "$MAX_CHECK_SERVERS" ] && CHECK_COUNT="$MAX_CHECK_SERVERS"
 
-          echo "Checking first $CHECK_COUNT servers..."
-          head -n "$CHECK_COUNT" hysteria_servers.txt | \
-            parallel -j "$PARALLEL_CHECKS" check_server {} > server_quality.txt 2>/dev/null || true
-
-          if [ ! -s server_quality.txt ]; then
-            echo "::warning::No servers passed quality check, using all hysteria servers"
-            cp hysteria_servers.txt server_quality.txt
-            sed -i 's/^/999999|/' server_quality.txt
+          > hysteria_quality.txt
+          if [ "$CHECK_COUNT" -gt 0 ]; then
+            echo "Testing first $CHECK_COUNT hysteria servers..."
+            head -n "$CHECK_COUNT" hysteria_servers.txt | \
+              parallel -j "$PARALLEL_CHECKS" check_server {} > hysteria_quality.txt 2>/dev/null || true
           fi
 
-          sort -t'|' -k1 -n server_quality.txt > server_quality_sorted.txt
+          sort -t'|' -k1 -n hysteria_quality.txt > hysteria_quality_sorted.txt
 
-          echo "Tested and reachable servers: $(wc -l < server_quality_sorted.txt)"
+          TESTED_COUNT=$(wc -l < hysteria_quality_sorted.txt)
+          echo "tested_count=$TESTED_COUNT" >> $GITHUB_OUTPUT
+          echo "Tested and reachable hysteria servers: $TESTED_COUNT"
 
-      - name: Select best servers (guaranteed fastest)
+      - name: Fallback - test other servers if hysteria not enough
+        id: fallback
+        run: |
+          set -e
+
+          TESTED_HYSTERIA=$(wc -l < hysteria_quality_sorted.txt 2>/dev/null || echo 0)
+          NEEDED=$(( MAX_SERVERS - TESTED_HYSTERIA ))
+
+          > other_quality_sorted.txt
+
+          if [ "$NEEDED" -gt 0 ] && [ -s other_servers.txt ]; then
+            echo "::warning::Only $TESTED_HYSTERIA hysteria servers passed testing (${MAX_SERVERS} needed) — testing fastest among OTHER (non-hysteria) VLESS links as fallback"
+
+            source check_server.sh
+            export -f check_server
+            export TIMEOUT PING_COUNT
+
+            CHECK_COUNT=$(wc -l < other_servers.txt)
+            [ "$CHECK_COUNT" -gt "$MAX_CHECK_OTHERS" ] && CHECK_COUNT="$MAX_CHECK_OTHERS"
+
+            echo "Testing first $CHECK_COUNT other servers..."
+            head -n "$CHECK_COUNT" other_servers.txt | \
+              parallel -j "$PARALLEL_CHECKS" check_server {} > other_quality.txt 2>/dev/null || true
+
+            if [ -s other_quality.txt ]; then
+              sort -t'|' -k1 -n other_quality.txt > other_quality_sorted.txt
+            fi
+          else
+            echo "Hysteria servers already cover ${MAX_SERVERS}, skipping fallback test"
+          fi
+
+          TESTED_OTHER=$(wc -l < other_quality_sorted.txt 2>/dev/null || echo 0)
+          echo "tested_other=$TESTED_OTHER" >> $GITHUB_OUTPUT
+          echo "Tested and reachable other servers: $TESTED_OTHER"
+
+      - name: Select best servers (hysteria priority, fastest by ping)
         id: select
         run: |
           set -e
 
-          echo "Selecting the fastest servers (guaranteed count: ${MAX_SERVERS})..."
+          echo "Selecting ${MAX_SERVERS} servers: hysteria first (by ping), then fastest others to fill gaps..."
 
           > selected.txt
+          > selected_quality.txt
 
-          # ГЛАВНЫЙ ПРИНЦИП: сначала берём просто ${MAX_SERVERS} самых
-          # быстрых из уже протестированных и доступных серверов —
-          # server_quality_sorted.txt отсортирован по реальному score
-          # (эффективный ping в мс, меньше = быстрее). Никаких квот по
-          # странам на этом этапе: если 5 самых быстрых окажутся все не
-          # из России — значит, так и должно быть, "самые быстрые"
-          # важнее, чем искусственный баланс RU/Other.
-          if [ -s server_quality_sorted.txt ]; then
-            cut -d'|' -f2 server_quality_sorted.txt | head -n "${MAX_SERVERS}" >> selected.txt
+          # 1) Приоритет: сначала берём протестированные hysteria-сервера,
+          #    отсортированные по реальному score (ping), сколько наберётся
+          #    (до MAX_SERVERS).
+          if [ -s hysteria_quality_sorted.txt ]; then
+            head -n "${MAX_SERVERS}" hysteria_quality_sorted.txt >> selected_quality.txt
           fi
 
-          sort -u selected.txt -o selected.txt
-
-          SELECTED_COUNT=$(wc -l < selected.txt 2>/dev/null || echo 0)
+          SELECTED_COUNT=$(wc -l < selected_quality.txt)
           NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
 
-          # ГАРАНТИЯ КОЛИЧЕСТВА: если протестированных и доступных
-          # серверов набралось меньше ${MAX_SERVERS} (например, почти все
-          # не прошли проверку порта/пинга из-за проблем сети), добираем
-          # недостающее количество из полного списка серверов
-          # (hysteria_servers.txt — который сам, в свою очередь, уже
-          # содержит ВСЕ VLESS-ссылки, если hysteria-серверов не нашлось
-          # вообще, см. шаг "Detect hysteria servers"). Без данных о
-          # скорости, но лишь бы гарантированно выдать ${MAX_SERVERS}
-          # рабочих ссылок, а не меньше.
-          if [ "$NEEDED" -gt 0 ] && [ -s hysteria_servers.txt ]; then
-            echo "::warning::Only $SELECTED_COUNT tested fast servers found, padding with untested links to reach ${MAX_SERVERS}"
-            grep -Fvxf selected.txt hysteria_servers.txt | head -n "$NEEDED" >> selected.txt || true
+          # 2) Если hysteria не хватило — добираем недостающие места
+          #    самыми быстрыми (по ping) протестированными "остальными"
+          #    серверами.
+          if [ "$NEEDED" -gt 0 ] && [ -s other_quality_sorted.txt ]; then
+            echo "::warning::Hysteria gave only $SELECTED_COUNT servers, filling $NEEDED slot(s) with fastest non-hysteria tested servers"
+            head -n "$NEEDED" other_quality_sorted.txt >> selected_quality.txt
           fi
 
-          sed -i '/^$/d' selected.txt
-          sort -u selected.txt -o selected.txt
-          head -n "${MAX_SERVERS}" selected.txt > temp.txt
-          mv temp.txt selected.txt
+          SELECTED_COUNT=$(wc -l < selected_quality.txt)
+          NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
+
+          # 3) Крайний случай: даже вместе hysteria + fallback тест не дал
+          #    MAX_SERVERS рабочих серверов (в источнике реально мало живых
+          #    серверов). Добираем без теста, просто чтобы не терять
+          #    количество — сначала из hysteria_servers.txt, потом из
+          #    unique.txt.
+          if [ "$NEEDED" -gt 0 ]; then
+            echo "::warning::Only $SELECTED_COUNT tested servers total, padding with untested links to reach ${MAX_SERVERS}"
+            cut -d'|' -f2 selected_quality.txt > selected_links_tmp.txt
+            cat hysteria_servers.txt other_servers.txt | \
+              grep -Fvxf selected_links_tmp.txt | \
+              awk '!seen[$0]++' | \
+              head -n "$NEEDED" | \
+              sed 's/^/999999|/; s/$/|n\/a/' >> selected_quality.txt
+          fi
+
+          head -n "${MAX_SERVERS}" selected_quality.txt > temp_quality.txt
+          mv temp_quality.txt selected_quality.txt
+
+          cut -d'|' -f2 selected_quality.txt > selected.txt
 
           FINAL_COUNT=$(wc -l < selected.txt)
           echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
-          echo "Selected $FINAL_COUNT servers (fastest-first, guaranteed)"
+          echo "Selected $FINAL_COUNT servers (hysteria priority, fastest by ping)"
 
       - name: Generate output files
         id: generate
@@ -304,28 +354,22 @@ jobs:
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
-            echo "# servers: $FINAL_COUNT (5 самых быстрых по тестам)"
+            echo "# servers: $FINAL_COUNT (5 самых быстрых по тестам, приоритет hysteria)"
             echo "# total_links: $TOTAL_LINKS"
             echo "# Hysteria servers: $HYSTERIA_COUNT total"
             echo ""
 
             COUNT=1
-            while IFS= read -r link; do
+            while IFS='|' read -r score link ping; do
               [ -z "$link" ] && continue
-              QUALITY_INFO=$(grep -F "|$link|" server_quality_sorted.txt 2>/dev/null | head -1)
-              if [ -n "$QUALITY_INFO" ]; then
-                PING=$(echo "$QUALITY_INFO" | cut -d'|' -f3)
-                if [ "$PING" != "n/a" ]; then
-                  echo "📱LTE Обход #$COUNT [Ping:${PING}ms]"
-                else
-                  echo "📱LTE Обход #$COUNT"
-                fi
+              if [ "$ping" != "n/a" ] && [ -n "$ping" ]; then
+                echo "📱LTE Обход #$COUNT [Ping:${ping}ms]"
               else
                 echo "📱LTE Обход #$COUNT"
               fi
               echo "$link"
               ((COUNT++))
-            done < selected.txt
+            done < selected_quality.txt
           } > public/white-list.txt
 
           cat selected.txt > public/android.txt
@@ -349,7 +393,7 @@ jobs:
           <body>
             <h1>✅ Hysteria Lists - Updated: $DATE $TIME</h1>
             <div class="stats">
-              <div class="stat-item"><strong>Total servers:</strong> $FINAL_COUNT (5 fastest)</div>
+              <div class="stat-item"><strong>Total servers:</strong> $FINAL_COUNT (5 fastest, hysteria priority)</div>
               <div class="stat-item"><strong>Hysteria servers found:</strong> $HYSTERIA_COUNT</div>
               <div class="stat-item"><strong>Total links checked:</strong> $TOTAL_LINKS</div>
             </div>
@@ -417,10 +461,12 @@ jobs:
           echo "=== Debug Info ==="
           echo "Directory contents:"
           ls -la public/ || echo "Public directory not found"
-          echo "=== selected.txt ==="
-          cat selected.txt 2>/dev/null || echo "File not found"
-          echo "=== server_quality_sorted.txt (top 10) ==="
-          head -10 server_quality_sorted.txt 2>/dev/null || echo "File not found"
+          echo "=== selected_quality.txt ==="
+          cat selected_quality.txt 2>/dev/null || echo "File not found"
+          echo "=== hysteria_quality_sorted.txt (top 10) ==="
+          head -10 hysteria_quality_sorted.txt 2>/dev/null || echo "File not found"
+          echo "=== other_quality_sorted.txt (top 10) ==="
+          head -10 other_quality_sorted.txt 2>/dev/null || echo "File not found"
 
   deploy:
     needs: build
