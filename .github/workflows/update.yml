@@ -13,11 +13,12 @@ permissions:
 env:
   CONFIG_URL: "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt"
   MAX_SERVERS: 5             # Гарантированное количество серверов в итоговом файле
-  TIMEOUT: 2                 # Таймаут проверки TCP-порта, сек
+  TIMEOUT: 2                 # Таймаут одной попытки TCP-подключения, сек
   PARALLEL_CHECKS: 20        # Параллельных проверок
-  MAX_CHECK_SERVERS: 300     # Сколько серверов реально тестируем за прогон (hysteria)
+  MAX_CHECK_SERVERS: 300     # Сколько hysteria-серверов реально тестируем за прогон
   MAX_CHECK_OTHERS: 200      # Сколько НЕ-hysteria серверов тестируем в fallback-е
-  PING_COUNT: 3              # Сколько раз пинговать каждый сервер
+  SAMPLES: 3                 # Сколько раз замеряем TCP-хендшейк для каждого сервера
+  LOSS_PENALTY_MS: 200       # Штраф (мс) за каждую неответившую попытку подключения
 
 jobs:
   build:
@@ -42,7 +43,7 @@ jobs:
           done
 
           sudo apt-get update
-          sudo apt-get install -y parallel jq netcat-openbsd bc
+          sudo apt-get install -y parallel jq
           echo "TZ=Europe/Moscow" >> $GITHUB_ENV
 
       - name: Download and validate config
@@ -157,6 +158,15 @@ jobs:
 
       - name: Prepare check function
         run: |
+          # Замер строится на реальном TCP-хендшейке до host:port (через bash
+          # /dev/tcp), а не на ICMP ping. Это важнее по двум причинам:
+          #  1) ICMP часто закрыт файрволом хостера — рабочий и быстрый сервер
+          #     мог бы получить "n/a" только из-за этого, что портит рейтинг;
+          #  2) реальный VLESS-трафик идёт именно через TCP-порт, так что время
+          #     TCP-хендшейка — куда более честная метрика "скорости" сервера,
+          #     чем ICMP-пинг до хоста.
+          # Дополнительно берём МЕДИАНУ по нескольким замерам вместо среднего —
+          # она устойчивее к единичным всплескам задержки на одном замере.
           cat > check_server.sh << 'SCRIPT'
           check_server() {
             local link="$1"
@@ -178,42 +188,57 @@ jobs:
               return 1
             fi
 
-            if ! timeout "$TIMEOUT" nc -zv "$host" "$port" 2>&1 | grep -q "Connected\|succeeded"; then
-              return 1
-            fi
+            local samples=() sent=0 recv=0 fails=0
 
-            local samples=() sent=0 recv=0
-            for _ in $(seq 1 "$PING_COUNT"); do
+            for _ in $(seq 1 "$SAMPLES"); do
               sent=$((sent + 1))
-              local ms
-              ms=$(ping -c 1 -W 1 "$host" 2>/dev/null | grep -oP 'time=\K[0-9.]+' | head -n1 || true)
-              if [ -n "$ms" ]; then
+              local start end elapsed_ms
+
+              start=$(date +%s%N)
+              if timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+                end=$(date +%s%N)
+                exec 3<&- 3>&- 2>/dev/null || true
+                elapsed_ms=$(( (end - start) / 1000000 ))
                 recv=$((recv + 1))
-                samples+=("$ms")
+                samples+=("$elapsed_ms")
+              else
+                fails=$((fails + 1))
+                # Ранний выход: если сервер не ответил дважды подряд с самого
+                # начала, дальше не мучаем его оставшимися попытками — почти
+                # наверняка недоступен, а время лучше потратить на другие.
+                if [ "$fails" -ge 2 ] && [ "$recv" -eq 0 ]; then
+                  break
+                fi
               fi
             done
 
-            local score
-            if [ "${#samples[@]}" -gt 0 ]; then
-              local sum=0
-              for s in "${samples[@]}"; do
-                sum=$(echo "$sum + $s" | bc)
-              done
-              local avg
-              avg=$(echo "scale=2; $sum / ${#samples[@]}" | bc)
-              local loss_penalty
-              loss_penalty=$(echo "scale=2; ($sent - $recv) * 40" | bc)
-              score=$(echo "$avg + $loss_penalty" | bc)
-              echo "${score}|${link}|${avg}"
-            else
-              echo "999|${link}|n/a"
+            if [ "$recv" -eq 0 ]; then
+              return 1
             fi
+
+            # Медиана по успешным замерам
+            local sorted
+            sorted=($(printf '%s\n' "${samples[@]}" | sort -n))
+            local n=${#sorted[@]}
+            local mid=$(( n / 2 ))
+            local median
+            if (( n % 2 == 1 )); then
+              median=${sorted[$mid]}
+            else
+              median=$(( (sorted[mid-1] + sorted[mid]) / 2 ))
+            fi
+
+            local loss=$(( sent - recv ))
+            local loss_penalty=$(( loss * LOSS_PENALTY_MS ))
+            local score=$(( median + loss_penalty ))
+
+            echo "${score}|${link}|${median}ms (${recv}/${sent} ok)"
           }
           SCRIPT
 
           echo "check_server.sh ready"
 
-      - name: Check hysteria server quality (ping + port)
+      - name: Check hysteria server quality (real TCP handshake timing)
         id: check
         run: |
           set -e
@@ -221,7 +246,7 @@ jobs:
           echo "Checking HYSTERIA server quality..."
           source check_server.sh
           export -f check_server
-          export TIMEOUT PING_COUNT
+          export TIMEOUT SAMPLES LOSS_PENALTY_MS
 
           TOTAL_HYSTERIA=$(wc -l < hysteria_servers.txt)
           CHECK_COUNT=$TOTAL_HYSTERIA
@@ -255,7 +280,7 @@ jobs:
 
             source check_server.sh
             export -f check_server
-            export TIMEOUT PING_COUNT
+            export TIMEOUT SAMPLES LOSS_PENALTY_MS
 
             CHECK_COUNT=$(wc -l < other_servers.txt)
             [ "$CHECK_COUNT" -gt "$MAX_CHECK_OTHERS" ] && CHECK_COUNT="$MAX_CHECK_OTHERS"
@@ -275,19 +300,19 @@ jobs:
           echo "tested_other=$TESTED_OTHER" >> $GITHUB_OUTPUT
           echo "Tested and reachable other servers: $TESTED_OTHER"
 
-      - name: Select best servers (hysteria priority, fastest by ping)
+      - name: Select best servers (hysteria priority, fastest by real TCP latency)
         id: select
         run: |
           set -e
 
-          echo "Selecting ${MAX_SERVERS} servers: hysteria first (by ping), then fastest others to fill gaps..."
+          echo "Selecting ${MAX_SERVERS} servers: hysteria first (by latency), then fastest others to fill gaps..."
 
           > selected.txt
           > selected_quality.txt
 
           # 1) Приоритет: сначала берём протестированные hysteria-сервера,
-          #    отсортированные по реальному score (ping), сколько наберётся
-          #    (до MAX_SERVERS).
+          #    отсортированные по реальному score (медиана TCP-хендшейка +
+          #    штраф за потери), сколько наберётся (до MAX_SERVERS).
           if [ -s hysteria_quality_sorted.txt ]; then
             head -n "${MAX_SERVERS}" hysteria_quality_sorted.txt >> selected_quality.txt
           fi
@@ -296,8 +321,8 @@ jobs:
           NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
 
           # 2) Если hysteria не хватило — добираем недостающие места
-          #    самыми быстрыми (по ping) протестированными "остальными"
-          #    серверами.
+          #    самыми быстрыми (по тому же score) протестированными
+          #    "остальными" серверами.
           if [ "$NEEDED" -gt 0 ] && [ -s other_quality_sorted.txt ]; then
             echo "::warning::Hysteria gave only $SELECTED_COUNT servers, filling $NEEDED slot(s) with fastest non-hysteria tested servers"
             head -n "$NEEDED" other_quality_sorted.txt >> selected_quality.txt
@@ -307,10 +332,8 @@ jobs:
           NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
 
           # 3) Крайний случай: даже вместе hysteria + fallback тест не дал
-          #    MAX_SERVERS рабочих серверов (в источнике реально мало живых
-          #    серверов). Добираем без теста, просто чтобы не терять
-          #    количество — сначала из hysteria_servers.txt, потом из
-          #    unique.txt.
+          #    MAX_SERVERS рабочих серверов. Добираем без теста, просто
+          #    чтобы не терять количество.
           if [ "$NEEDED" -gt 0 ]; then
             echo "::warning::Only $SELECTED_COUNT tested servers total, padding with untested links to reach ${MAX_SERVERS}"
             cut -d'|' -f2 selected_quality.txt > selected_links_tmp.txt
@@ -328,7 +351,7 @@ jobs:
 
           FINAL_COUNT=$(wc -l < selected.txt)
           echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
-          echo "Selected $FINAL_COUNT servers (hysteria priority, fastest by ping)"
+          echo "Selected $FINAL_COUNT servers (hysteria priority, fastest by real TCP latency)"
 
       - name: Generate output files
         id: generate
@@ -360,10 +383,10 @@ jobs:
             echo ""
 
             COUNT=1
-            while IFS='|' read -r score link ping; do
+            while IFS='|' read -r score link info; do
               [ -z "$link" ] && continue
-              if [ "$ping" != "n/a" ] && [ -n "$ping" ]; then
-                echo "📱LTE Обход #$COUNT [Ping:${ping}ms]"
+              if [ -n "$info" ] && [ "$info" != "n/a" ]; then
+                echo "📱LTE Обход #$COUNT [${info}]"
               else
                 echo "📱LTE Обход #$COUNT"
               fi
