@@ -17,17 +17,32 @@ env:
   OTHER_SERVERS: 2
   TIMEOUT: 2
   PARALLEL_CHECKS: 20
-  MAX_CHECK_SERVERS: 200
-  PING_COUNT: 2
+  MAX_CHECK_SERVERS: 300
+  PING_COUNT: 3
+  GEOIP_BATCH_SIZE: 100
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 7
 
     steps:
       - name: Setup environment
         run: |
+          set -e
+
+          # На раннере ubuntu-latest бывает предустановлен репозиторий
+          # packages.microsoft.com (azure-cli), который периодически отдаёт
+          # битую подпись и валит apt-get update кодом 100. Он нам не нужен —
+          # ищем по содержимому файла (имя может быть *.list или *.sources)
+          # и удаляем, чтобы не зависеть от network-флуктуаций Microsoft.
+          for f in /etc/apt/sources.list.d/*; do
+            if [ -f "$f" ] && grep -q "packages.microsoft.com" "$f" 2>/dev/null; then
+              echo "Removing broken repo file: $f"
+              sudo rm -f "$f"
+            fi
+          done
+
           sudo apt-get update
           sudo apt-get install -y parallel jq netcat-openbsd bc
           echo "TZ=Europe/Moscow" >> $GITHUB_ENV
@@ -37,7 +52,7 @@ jobs:
         run: |
           set -e
           mkdir -p public
-          
+
           echo "Downloading config from ${{ env.CONFIG_URL }}"
           if ! curl -fLsS --connect-timeout 10 --max-time 30 \
             "${{ env.CONFIG_URL }}" -o all.txt; then
@@ -45,13 +60,13 @@ jobs:
             echo "status=error" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
+
           if [ ! -s all.txt ]; then
             echo "::error::Config file is empty"
             echo "status=error" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
+
           echo "status=success" >> $GITHUB_OUTPUT
 
       - name: Get traffic stats
@@ -60,7 +75,7 @@ jobs:
           set -e
           API_URL="${{ secrets.API_URL }}"
           API_KEY="${{ secrets.API_KEY }}"
-          
+
           if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
             echo "::warning::API credentials not configured"
             echo "upload=0" >> $GITHUB_OUTPUT
@@ -68,7 +83,7 @@ jobs:
             echo "total=0" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
+
           echo "Fetching traffic stats..."
           RESPONSE=$(curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$API_URL" 2>/dev/null) || {
             echo "upload=0" >> $GITHUB_OUTPUT
@@ -76,18 +91,18 @@ jobs:
             echo "total=0" >> $GITHUB_OUTPUT
             exit 0
           }
-          
+
           if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
             echo "upload=0" >> $GITHUB_OUTPUT
             echo "download=0" >> $GITHUB_OUTPUT
             echo "total=0" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
+
           UPLOAD=$(echo "$RESPONSE" | jq -r '.upload // 0')
           DOWNLOAD=$(echo "$RESPONSE" | jq -r '.download // 0')
           TOTAL=$((UPLOAD + DOWNLOAD))
-          
+
           echo "upload=$UPLOAD" >> $GITHUB_OUTPUT
           echo "download=$DOWNLOAD" >> $GITHUB_OUTPUT
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
@@ -96,21 +111,21 @@ jobs:
         id: extract
         run: |
           set -e
-          
+
           echo "Extracting VLESS links..."
           tr -d '\r' < all.txt | \
             grep -aEo 'vless://[^[:space:]]+' | \
             awk '!seen[$0]++' > unique.txt
-          
+
           if [ ! -s unique.txt ]; then
             echo "::error::No VLESS links found"
             echo "error=No VLESS links found" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
+
           grep -vE '(example\.com|test\.com|localhost|127\.0\.0\.1)' unique.txt > filtered.txt
           mv filtered.txt unique.txt
-          
+
           TOTAL_LINKS=$(wc -l < unique.txt)
           echo "total_links=$TOTAL_LINKS" >> $GITHUB_OUTPUT
           echo "Found $TOTAL_LINKS VLESS links"
@@ -119,36 +134,107 @@ jobs:
         id: hysteria
         run: |
           set -e
-          
+
           echo "Detecting hysteria servers..."
           grep -E '\?(.*&)?(host|sni)=[^&]*hysteria' unique.txt > hysteria_temp1.txt 2>/dev/null || true
           grep -i "hysteria" unique.txt > hysteria_temp2.txt 2>/dev/null || true
           cat hysteria_temp1.txt hysteria_temp2.txt | sort -u > hysteria_servers.txt 2>/dev/null || true
-          
+
           if [ ! -s hysteria_servers.txt ]; then
             echo "::warning::No hysteria servers found, using all links"
             cp unique.txt hysteria_servers.txt
           fi
-          
+
           rm -f hysteria_temp1.txt hysteria_temp2.txt
-          
+
           HYSTERIA_COUNT=$(wc -l < hysteria_servers.txt)
           echo "hysteria_count=$HYSTERIA_COUNT" >> $GITHUB_OUTPUT
           echo "Found $HYSTERIA_COUNT hysteria servers"
+
+      - name: Resolve host countries (batched)
+        id: geoip
+        run: |
+          set -e
+
+          # ВАЖНО: раньше страна определялась запросом к ip-api.com отдельно
+          # для КАЖДОГО сервера прямо внутри параллельной проверки (до 200
+          # запросов почти одновременно). Бесплатный лимит ip-api.com — 45
+          # запросов в минуту, поэтому большинство запросов улетали в 429,
+          # и сервер получал country=UNKNOWN — деление на Russia/Other
+          # фактически переставало работать.
+          #
+          # Исправление: собираем уникальные хосты один раз, бьём на пачки
+          # по GEOIP_BATCH_SIZE и используем batch-эндпоинт ip-api.com,
+          # который принимает до 100 хостов за один запрос. Итог — вместо
+          # сотен запросов делаем единицы, укладываемся в лимит с запасом,
+          # и внутри проверки серверов сеть больше не дёргаем вообще —
+          # только читаем готовую карту host->country из файла.
+
+          extract_host() {
+            local link="$1"
+            local host
+            if [[ $link =~ vless://[^@]+@([^:]+): ]]; then
+              host="${BASH_REMATCH[1]}"
+            elif [[ $link =~ vless://[^/]+/([^:]+): ]]; then
+              host="${BASH_REMATCH[1]}"
+            else
+              host=$(echo "$link" | sed -n 's/.*vless:\/\/[^@]*@\([^:]*\):.*/\1/p')
+            fi
+            [ -n "$host" ] && echo "$host"
+          }
+
+          TOTAL_HYSTERIA=$(wc -l < hysteria_servers.txt)
+          CHECK_COUNT=$TOTAL_HYSTERIA
+          [ "$CHECK_COUNT" -gt "$MAX_CHECK_SERVERS" ] && CHECK_COUNT="$MAX_CHECK_SERVERS"
+          head -n "$CHECK_COUNT" hysteria_servers.txt > to_check.txt
+
+          : > hosts.txt
+          while IFS= read -r link; do
+            extract_host "$link" >> hosts.txt
+          done < to_check.txt
+          sort -u hosts.txt -o hosts.txt
+
+          echo "Unique hosts to geo-locate: $(wc -l < hosts.txt)"
+
+          : > country_map.txt
+          split -l "$GEOIP_BATCH_SIZE" hosts.txt geoip_batch_ 2>/dev/null || true
+
+          for batch_file in geoip_batch_*; do
+            [ -f "$batch_file" ] || continue
+            json_array=$(jq -R -s -c 'split("\n") | map(select(length > 0))' "$batch_file")
+
+            response=$(curl -s --max-time 15 -X POST \
+              -H "Content-Type: application/json" \
+              -d "$json_array" \
+              "http://ip-api.com/batch?fields=query,countryCode" 2>/dev/null || echo "")
+
+            if [ -n "$response" ] && echo "$response" | jq -e . >/dev/null 2>&1; then
+              echo "$response" | jq -r '.[] | "\(.query)|\(.countryCode // "UNKNOWN")"' >> country_map.txt
+            else
+              echo "::warning::Geoip batch request failed for $batch_file, marking as UNKNOWN"
+              awk '{print $0"|UNKNOWN"}' "$batch_file" >> country_map.txt
+            fi
+
+            # Мягкая пауза между пачками, чтобы не упереться в лимит
+            # (15 запросов/минуту на batch-эндпоинте ip-api.com)
+            sleep 1
+          done
+
+          rm -f geoip_batch_*
+
+          echo "Resolved countries: $(wc -l < country_map.txt)"
 
       - name: Check server quality (ping + port)
         id: check
         run: |
           set -e
-          
+
           echo "Checking server quality..."
-          
-          # Функция проверки сервера
+
           check_server() {
             local link="$1"
             local host port
-            
-            # Извлечение хоста и порта
+
             if [[ $link =~ vless://[^@]+@([^:]+):([0-9]+) ]]; then
               host="${BASH_REMATCH[1]}"
               port="${BASH_REMATCH[2]}"
@@ -160,72 +246,71 @@ jobs:
               port=$(echo "$link" | sed -n 's/.*:\([0-9]*\)[^0-9]*$/\1/p')
               [ -z "$port" ] && port="443"
             fi
-            
+
             if [ -z "$host" ] || [ -z "$port" ]; then
               return 1
             fi
-            
-            # Проверка порта
-            if ! timeout ${{ env.TIMEOUT }} nc -zv "$host" "$port" 2>&1 | grep -q "Connected\|succeeded"; then
+
+            if ! timeout "$TIMEOUT" nc -zv "$host" "$port" 2>&1 | grep -q "Connected\|succeeded"; then
               return 1
             fi
-            
-            # Получение страны
-            country=$(curl -s --max-time 2 "http://ip-api.com/line/$host?fields=countryCode" 2>/dev/null || echo "UNKNOWN")
-            
-            # Измерение ping с использованием ping
-            local ping_avg="999"
-            local ping_output=$(ping -c ${{ env.PING_COUNT }} -W 1 "$host" 2>/dev/null)
-            if [ $? -eq 0 ]; then
-              ping_avg=$(echo "$ping_output" | grep 'avg' | grep -o '[0-9.]*' | tail -1)
-              [ -z "$ping_avg" ] && ping_avg="999"
-            fi
-            
-            # Вычисление рейтинга на основе ping
-            # < 50ms: 100, 50-100ms: 80, 100-150ms: 60, 150-200ms: 40, >200ms: 20
-            if [ "$ping_avg" != "999" ]; then
-              score=$(echo "$ping_avg" | awk '{
-                if ($1 < 50) print 100
-                else if ($1 < 100) print 80
-                else if ($1 < 150) print 60
-                else if ($1 < 200) print 40
-                else if ($1 < 300) print 20
-                else print 10
-              }')
+
+            local country
+            country=$(grep "^${host}|" country_map.txt 2>/dev/null | cut -d'|' -f2 | head -n1)
+            [ -z "$country" ] && country="UNKNOWN"
+
+            local samples=() sent=0 recv=0
+            for _ in $(seq 1 "$PING_COUNT"); do
+              sent=$((sent + 1))
+              local ms
+              ms=$(ping -c 1 -W 1 "$host" 2>/dev/null | grep -oP 'time=\K[0-9.]+' | head -n1 || true)
+              if [ -n "$ms" ]; then
+                recv=$((recv + 1))
+                samples+=("$ms")
+              fi
+            done
+
+            local score
+            if [ "${#samples[@]}" -gt 0 ]; then
+              local sum=0
+              for s in "${samples[@]}"; do
+                sum=$(echo "$sum + $s" | bc)
+              done
+              local avg
+              avg=$(echo "scale=2; $sum / ${#samples[@]}" | bc)
+              local loss_penalty
+              loss_penalty=$(echo "scale=2; ($sent - $recv) * 40" | bc)
+              score=$(echo "$avg + $loss_penalty" | bc)
+              echo "${score}|${link}|${country}|${avg}"
             else
-              score=50  # Средний рейтинг если ping не удался
+              echo "999|${link}|${country}|n/a"
             fi
-            
-            echo "$score|$link|$country|$ping_avg"
           }
           export -f check_server
-          
-          # Проверка серверов с лимитом
+          export TIMEOUT PING_COUNT
+
           TOTAL_HYSTERIA=$(wc -l < hysteria_servers.txt)
-          CHECK_COUNT=$((TOTAL_HYSTERIA < ${{ env.MAX_CHECK_SERVERS }} ? TOTAL_HYSTERIA : ${{ env.MAX_CHECK_SERVERS }}))
-          
+          CHECK_COUNT=$TOTAL_HYSTERIA
+          [ "$CHECK_COUNT" -gt "$MAX_CHECK_SERVERS" ] && CHECK_COUNT="$MAX_CHECK_SERVERS"
+
           echo "Checking first $CHECK_COUNT servers..."
-          head -"$CHECK_COUNT" hysteria_servers.txt | \
-            parallel -j ${{ env.PARALLEL_CHECKS }} check_server {} > server_quality.txt 2>/dev/null || true
-          
-          # Проверка, есть ли результаты
+          head -n "$CHECK_COUNT" hysteria_servers.txt | \
+            parallel -j "$PARALLEL_CHECKS" check_server {} > server_quality.txt 2>/dev/null || true
+
           if [ ! -s server_quality.txt ]; then
             echo "::warning::No servers passed quality check, using all hysteria servers"
             cp hysteria_servers.txt server_quality.txt
-            # Добавляем фейковые данные для сортировки
-            sed -i 's/^/50|/' server_quality.txt
+            sed -i 's/^/999999|/' server_quality.txt
           fi
-          
-          # Сортировка по рейтингу (от лучшего к худшему)
-          sort -t'|' -k1 -rn server_quality.txt > server_quality_sorted.txt
-            
-          # Разделение по странам с рейтингом
+
+          sort -t'|' -k1 -n server_quality.txt > server_quality_sorted.txt
+
           grep -E '\|RU\|' server_quality_sorted.txt > quality_russia.txt || true
-          grep -E '\|(US|DE|FR|GB|NL|CA|AU|SG|JP|KR|IT|ES|SE|NO|FI|DK|BE|CH|AT|NZ|HK|TW|IN|BR|MX|ZA|AE|IL)\|' server_quality_sorted.txt > quality_other.txt || true
-          
+          grep -vE '\|(RU|UNKNOWN)\|' server_quality_sorted.txt > quality_other.txt || true
+
           RUSSIA_COUNT=$(wc -l < quality_russia.txt 2>/dev/null || echo 0)
           OTHER_COUNT=$(wc -l < quality_other.txt 2>/dev/null || echo 0)
-          
+
           echo "russia_count=$RUSSIA_COUNT" >> $GITHUB_OUTPUT
           echo "other_count=$OTHER_COUNT" >> $GITHUB_OUTPUT
           echo "Found $RUSSIA_COUNT quality Russia servers, $OTHER_COUNT quality other servers"
@@ -234,52 +319,46 @@ jobs:
         id: select
         run: |
           set -e
-          
+
           echo "Selecting best servers by quality score..."
-          
+
           > selected.txt
-          
-          # Выбор лучших Russia серверов по рейтингу
+
           if [ -s quality_russia.txt ]; then
-            head -${{ env.RUSSIA_SERVERS }} quality_russia.txt | cut -d'|' -f2 >> selected.txt
+            head -"${RUSSIA_SERVERS}" quality_russia.txt | cut -d'|' -f2 >> selected.txt
             echo "Selected Russia servers from quality list"
           fi
-          
-          # Выбор лучших other серверов по рейтингу
+
           if [ -s quality_other.txt ]; then
-            head -${{ env.OTHER_SERVERS }} quality_other.txt | cut -d'|' -f2 >> selected.txt
+            head -"${OTHER_SERVERS}" quality_other.txt | cut -d'|' -f2 >> selected.txt
             echo "Selected Other servers from quality list"
           fi
-          
-          # Если ничего не выбрано, берем из общего списка
+
           if [ ! -s selected.txt ]; then
             echo "::warning::No servers selected from quality lists, taking from all"
-            head -${{ env.MAX_SERVERS }} hysteria_servers.txt > selected.txt
+            head -"${MAX_SERVERS}" hysteria_servers.txt > selected.txt
           fi
-          
-          # Удаление дубликатов
+
           sort -u selected.txt > selected_unique.txt
           mv selected_unique.txt selected.txt
-          
-          # Fallback если мало серверов
+
           SELECTED_COUNT=$(wc -l < selected.txt 2>/dev/null || echo 0)
-          NEEDED=$(( ${{ env.MAX_SERVERS }} - SELECTED_COUNT ))
-          
+          NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
+
           if [ "$NEEDED" -gt 0 ] && [ -s server_quality_sorted.txt ]; then
             echo "Need $NEEDED more servers, adding fallback..."
-            
+
             cut -d'|' -f2 server_quality_sorted.txt | \
               grep -Fvxf selected.txt | \
               head -"$NEEDED" >> selected.txt || true
           fi
-          
-          # Финальная очистка
+
           sed -i '/^$/d' selected.txt
           sort -u selected.txt > selected_unique.txt
           mv selected_unique.txt selected.txt
-          head -${{ env.MAX_SERVERS }} selected.txt > temp.txt
+          head -"${MAX_SERVERS}" selected.txt > temp.txt
           mv temp.txt selected.txt
-          
+
           FINAL_COUNT=$(wc -l < selected.txt)
           echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
           echo "Selected $FINAL_COUNT servers"
@@ -289,45 +368,43 @@ jobs:
         run: |
           set -e
           export TZ=Europe/Moscow
-          
+
           UPLOAD="${{ steps.traffic.outputs.upload || 0 }}"
           DOWNLOAD="${{ steps.traffic.outputs.download || 0 }}"
           TOTAL="${{ steps.traffic.outputs.total || 0 }}"
-          
+
           FINAL_COUNT="${{ steps.select.outputs.final_count || 0 }}"
           HYSTERIA_COUNT="${{ steps.hysteria.outputs.hysteria_count || 0 }}"
           RUSSIA_COUNT="${{ steps.check.outputs.russia_count || 0 }}"
           OTHER_COUNT="${{ steps.check.outputs.other_count || 0 }}"
           TOTAL_LINKS="${{ steps.extract.outputs.total_links || 0 }}"
-          
-          # Расчет используемых серверов
+
           RUSSIA_USED=0
           OTHER_USED=0
-          
+
           if [ -s quality_russia.txt ] && [ -s selected.txt ]; then
             while IFS= read -r line; do
               link=$(echo "$line" | cut -d'|' -f2)
-              if grep -q "^$link$" selected.txt; then
+              if grep -qF "$link" selected.txt; then
                 RUSSIA_USED=$((RUSSIA_USED + 1))
               fi
             done < quality_russia.txt
           fi
-          
+
           if [ -s quality_other.txt ] && [ -s selected.txt ]; then
             while IFS= read -r line; do
               link=$(echo "$line" | cut -d'|' -f2)
-              if grep -q "^$link$" selected.txt; then
+              if grep -qF "$link" selected.txt; then
                 OTHER_USED=$((OTHER_USED + 1))
               fi
             done < quality_other.txt
           fi
-          
+
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
-          
+
           echo "Generating output files..."
-          
-          # Генерация white-list.txt
+
           {
             echo "# profile-title: @meowmeres 🏳️HYSTERIA LISTS🏳️"
             echo "# profile-update-interval: 1"
@@ -338,19 +415,17 @@ jobs:
             echo "# Hysteria servers: $HYSTERIA_COUNT total"
             echo "# Russia: $RUSSIA_USED (of $RUSSIA_COUNT quality) | Other: $OTHER_USED (of $OTHER_COUNT quality)"
             echo ""
-            
+
             COUNT=1
             while IFS= read -r link; do
               [ -z "$link" ] && continue
-              # Получение рейтинга для отображения
               QUALITY_INFO=$(grep -F "|$link|" server_quality_sorted.txt 2>/dev/null | head -1)
               if [ -n "$QUALITY_INFO" ]; then
-                SCORE=$(echo "$QUALITY_INFO" | cut -d'|' -f1)
                 PING=$(echo "$QUALITY_INFO" | cut -d'|' -f4)
-                if [ "$PING" != "999" ]; then
-                  echo "📱LTE Обход #$COUNT [Score:$SCORE|Ping:${PING}ms]"
+                if [ "$PING" != "n/a" ]; then
+                  echo "📱LTE Обход #$COUNT [Ping:${PING}ms]"
                 else
-                  echo "📱LTE Обход #$COUNT [Score:$SCORE]"
+                  echo "📱LTE Обход #$COUNT"
                 fi
               else
                 echo "📱LTE Обход #$COUNT"
@@ -359,11 +434,9 @@ jobs:
               ((COUNT++))
             done < selected.txt
           } > public/white-list.txt
-          
-          # Генерация android.txt (только ссылки)
+
           cat selected.txt > public/android.txt
-          
-          # Генерация index.html
+
           cat > public/index.html << EOF
           <!DOCTYPE html>
           <html>
@@ -395,8 +468,7 @@ jobs:
           </body>
           </html>
           EOF
-          
-          # Создание метаданных
+
           cat > public/meta.json << EOF
           {
             "update": "$DATE $TIME",
@@ -414,9 +486,9 @@ jobs:
             "max_servers": ${{ env.MAX_SERVERS }}
           }
           EOF
-          
+
           echo "Files generated successfully"
-          
+
           if [ ! -s public/white-list.txt ]; then
             echo "::error::Generated white-list.txt is empty"
             exit 1
@@ -426,20 +498,20 @@ jobs:
         id: validate
         run: |
           set -e
-          
+
           echo "Validating output..."
-          
+
           if ! head -n 1 public/white-list.txt | grep -q "^# profile-title:"; then
             echo "::error::Invalid white-list.txt format"
             exit 1
           fi
-          
+
           LINK_COUNT=$(grep -c "^vless://" public/white-list.txt || echo 0)
           if [ "$LINK_COUNT" -eq 0 ]; then
             echo "::error::No VLESS links in white-list.txt"
             exit 1
           fi
-          
+
           echo "Validated: $LINK_COUNT links in white-list.txt"
 
       - name: Setup Pages
@@ -466,6 +538,8 @@ jobs:
           head -5 quality_russia.txt 2>/dev/null || echo "File not found"
           echo "=== quality_other.txt (top 5) ==="
           head -5 quality_other.txt 2>/dev/null || echo "File not found"
+          echo "=== country_map.txt (top 10) ==="
+          head -10 country_map.txt 2>/dev/null || echo "File not found"
 
   deploy:
     needs: build
