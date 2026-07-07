@@ -13,11 +13,11 @@ permissions:
 env:
   CONFIG_URL: "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt"
   MAX_SERVERS: 5             # Гарантированное количество серверов в итоговом файле
-  TIMEOUT: 2                 # Таймаут одной попытки TCP-подключения, сек
+  TIMEOUT: 3                 # Таймаут одной попытки подключения (TCP/TLS), сек
   PARALLEL_CHECKS: 20        # Параллельных проверок
   MAX_CHECK_SERVERS: 300     # Сколько hysteria-серверов реально тестируем за прогон
   MAX_CHECK_OTHERS: 200      # Сколько НЕ-hysteria серверов тестируем в fallback-е
-  SAMPLES: 3                 # Сколько раз замеряем TCP-хендшейк для каждого сервера
+  SAMPLES: 3                 # Сколько раз замеряем каждый сервер
   LOSS_PENALTY_MS: 200       # Штраф (мс) за каждую неответившую попытку подключения
 
 jobs:
@@ -43,7 +43,7 @@ jobs:
           done
 
           sudo apt-get update
-          sudo apt-get install -y parallel jq
+          sudo apt-get install -y parallel jq openssl
           echo "TZ=Europe/Moscow" >> $GITHUB_ENV
 
       - name: Download and validate config
@@ -158,15 +158,26 @@ jobs:
 
       - name: Prepare check function
         run: |
-          # Замер строится на реальном TCP-хендшейке до host:port (через bash
-          # /dev/tcp), а не на ICMP ping. Это важнее по двум причинам:
-          #  1) ICMP часто закрыт файрволом хостера — рабочий и быстрый сервер
-          #     мог бы получить "n/a" только из-за этого, что портит рейтинг;
-          #  2) реальный VLESS-трафик идёт именно через TCP-порт, так что время
-          #     TCP-хендшейка — куда более честная метрика "скорости" сервера,
-          #     чем ICMP-пинг до хоста.
-          # Дополнительно берём МЕДИАНУ по нескольким замерам вместо среднего —
-          # она устойчивее к единичным всплескам задержки на одном замере.
+          # ВАЖНО: голый TCP-connect легко подделать. DPI/файрвол (типично
+          # для РКН-блокировок) может сам ответить поддельным SYN-ACK на
+          # заблокированный/подозрительный хост, создавая иллюзию быстрого
+          # "пинга" (например 15ms), хотя реального сервера за этим нет и
+          # никакого трафика дальше не пройдёт. Именно поэтому "самые
+          # быстрые по TCP" сервера иногда оказываются полностью нерабочими
+          # в реальном клиенте (Happ и т.п.), а более медленный, но настоящий
+          # сервер — единственный рабочий.
+          #
+          # Решение: для серверов с security=tls/reality проверяем не
+          # TCP-connect, а ПОЛНЫЙ TLS-хендшейк (openssl s_client) с тем же
+          # SNI/ALPN, что в самой ссылке. DPI может подделать SYN-ACK, но
+          # не способен провести настоящий TLS handshake с реальным
+          # сертификатом до настоящего сервера — фейковые "серверы" сразу
+          # отсеиваются. Для security=none (без TLS) остаётся обычный
+          # TCP-connect, так как TLS-слоя там физически нет.
+          #
+          # Плюс требуем БОЛЬШИНСТВО успешных попыток из SAMPLES — один
+          # случайный успех (тоже типичный для нестабильного/спуфленного
+          # соединения) не засчитывается как рабочий сервер.
           cat > check_server.sh << 'SCRIPT'
           check_server() {
             local link="$1"
@@ -188,35 +199,81 @@ jobs:
               return 1
             fi
 
+            # Достаём параметры из query-строки самой ссылки
+            local query="${link#*\?}"
+            query="${query%%#*}"
+            [ "$query" = "$link" ] && query=""
+
+            local security sni alpn
+            security=$(echo "$query" | grep -oP '(?:^|&)security=\K[^&]*' | head -1)
+
+            sni=$(echo "$query" | grep -oP '(?:^|&)sni=\K[^&]*' | head -1)
+            [ -z "$sni" ] && sni=$(echo "$query" | grep -oP '(?:^|&)host=\K[^&]*' | head -1)
+            if [ -n "$sni" ]; then
+              sni=$(printf '%b' "${sni//%/\\x}" 2>/dev/null) || sni="$host"
+            fi
+            [ -z "$sni" ] && sni="$host"
+
+            alpn=$(echo "$query" | grep -oP '(?:^|&)alpn=\K[^&]*' | head -1)
+            if [ -n "$alpn" ]; then
+              alpn=$(printf '%b' "${alpn//%/\\x}" 2>/dev/null) || alpn=""
+            fi
+
+            local use_tls=1
+            if [ "$security" = "none" ] || [ -z "$security" ]; then
+              use_tls=0
+            fi
+
             local samples=() sent=0 recv=0 fails=0
 
             for _ in $(seq 1 "$SAMPLES"); do
               sent=$((sent + 1))
-              local start end elapsed_ms
+              local start end elapsed_ms ok=0
 
               start=$(date +%s%N)
-              if timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+
+              if [ "$use_tls" -eq 1 ]; then
+                local ssl_out
+                if [ -n "$alpn" ]; then
+                  ssl_out=$(echo | timeout "$TIMEOUT" openssl s_client \
+                    -connect "${host}:${port}" -servername "$sni" -alpn "$alpn" 2>/dev/null)
+                else
+                  ssl_out=$(echo | timeout "$TIMEOUT" openssl s_client \
+                    -connect "${host}:${port}" -servername "$sni" 2>/dev/null)
+                fi
+                if echo "$ssl_out" | grep -q "Cipher is"; then
+                  ok=1
+                fi
+              else
+                if timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+                  exec 3<&- 3>&- 2>/dev/null || true
+                  ok=1
+                fi
+              fi
+
+              if [ "$ok" -eq 1 ]; then
                 end=$(date +%s%N)
-                exec 3<&- 3>&- 2>/dev/null || true
                 elapsed_ms=$(( (end - start) / 1000000 ))
                 recv=$((recv + 1))
                 samples+=("$elapsed_ms")
               else
                 fails=$((fails + 1))
                 # Ранний выход: если сервер не ответил дважды подряд с самого
-                # начала, дальше не мучаем его оставшимися попытками — почти
-                # наверняка недоступен, а время лучше потратить на другие.
+                # начала, дальше не мучаем его оставшимися попытками.
                 if [ "$fails" -ge 2 ] && [ "$recv" -eq 0 ]; then
                   break
                 fi
               fi
             done
 
-            if [ "$recv" -eq 0 ]; then
+            # Требуем большинство успешных попыток — единичный "везучий"
+            # (или спуфленный) ответ не считается рабочим сервером.
+            local majority=$(( (sent + 1) / 2 ))
+            if [ "$recv" -eq 0 ] || [ "$recv" -lt "$majority" ]; then
               return 1
             fi
 
-            # Медиана по успешным замерам
+            # Медиана по успешным замерам — устойчивее к всплескам, чем среднее
             local sorted
             sorted=($(printf '%s\n' "${samples[@]}" | sort -n))
             local n=${#sorted[@]}
@@ -232,13 +289,16 @@ jobs:
             local loss_penalty=$(( loss * LOSS_PENALTY_MS ))
             local score=$(( median + loss_penalty ))
 
-            echo "${score}|${link}|${median}ms (${recv}/${sent} ok)"
+            local proto="TCP"
+            [ "$use_tls" -eq 1 ] && proto="TLS"
+
+            echo "${score}|${link}|${median}ms ${proto} (${recv}/${sent} ok)"
           }
           SCRIPT
 
           echo "check_server.sh ready"
 
-      - name: Check hysteria server quality (real TCP handshake timing)
+      - name: Check hysteria server quality (real TLS/TCP handshake)
         id: check
         run: |
           set -e
@@ -263,7 +323,7 @@ jobs:
 
           TESTED_COUNT=$(wc -l < hysteria_quality_sorted.txt)
           echo "tested_count=$TESTED_COUNT" >> $GITHUB_OUTPUT
-          echo "Tested and reachable hysteria servers: $TESTED_COUNT"
+          echo "Tested and genuinely reachable hysteria servers: $TESTED_COUNT"
 
       - name: Fallback - test other servers if hysteria not enough
         id: fallback
@@ -298,21 +358,21 @@ jobs:
 
           TESTED_OTHER=$(wc -l < other_quality_sorted.txt 2>/dev/null || echo 0)
           echo "tested_other=$TESTED_OTHER" >> $GITHUB_OUTPUT
-          echo "Tested and reachable other servers: $TESTED_OTHER"
+          echo "Tested and genuinely reachable other servers: $TESTED_OTHER"
 
-      - name: Select best servers (hysteria priority, fastest by real TCP latency)
+      - name: Select best servers (hysteria priority, fastest genuine handshake)
         id: select
         run: |
           set -e
 
-          echo "Selecting ${MAX_SERVERS} servers: hysteria first (by latency), then fastest others to fill gaps..."
+          echo "Selecting ${MAX_SERVERS} servers: hysteria first (by real handshake latency), then fastest others to fill gaps..."
 
           > selected.txt
           > selected_quality.txt
 
-          # 1) Приоритет: сначала берём протестированные hysteria-сервера,
-          #    отсортированные по реальному score (медиана TCP-хендшейка +
-          #    штраф за потери), сколько наберётся (до MAX_SERVERS).
+          # 1) Приоритет: сначала берём протестированные (реальным TLS/TCP
+          #    хендшейком) hysteria-сервера, отсортированные по score,
+          #    сколько наберётся (до MAX_SERVERS).
           if [ -s hysteria_quality_sorted.txt ]; then
             head -n "${MAX_SERVERS}" hysteria_quality_sorted.txt >> selected_quality.txt
           fi
@@ -321,8 +381,7 @@ jobs:
           NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
 
           # 2) Если hysteria не хватило — добираем недостающие места
-          #    самыми быстрыми (по тому же score) протестированными
-          #    "остальными" серверами.
+          #    самыми быстрыми протестированными "остальными" серверами.
           if [ "$NEEDED" -gt 0 ] && [ -s other_quality_sorted.txt ]; then
             echo "::warning::Hysteria gave only $SELECTED_COUNT servers, filling $NEEDED slot(s) with fastest non-hysteria tested servers"
             head -n "$NEEDED" other_quality_sorted.txt >> selected_quality.txt
@@ -332,16 +391,17 @@ jobs:
           NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
 
           # 3) Крайний случай: даже вместе hysteria + fallback тест не дал
-          #    MAX_SERVERS рабочих серверов. Добираем без теста, просто
-          #    чтобы не терять количество.
+          #    MAX_SERVERS реально рабочих серверов. Добираем без теста
+          #    (просто чтобы не терять количество), явно помечая как
+          #    непроверенные (untested) — они могут не работать.
           if [ "$NEEDED" -gt 0 ]; then
-            echo "::warning::Only $SELECTED_COUNT tested servers total, padding with untested links to reach ${MAX_SERVERS}"
+            echo "::warning::Only $SELECTED_COUNT genuinely working servers found, padding with UNTESTED links to reach ${MAX_SERVERS} (may not work)"
             cut -d'|' -f2 selected_quality.txt > selected_links_tmp.txt
             cat hysteria_servers.txt other_servers.txt | \
               grep -Fvxf selected_links_tmp.txt | \
               awk '!seen[$0]++' | \
               head -n "$NEEDED" | \
-              sed 's/^/999999|/; s/$/|n\/a/' >> selected_quality.txt
+              sed 's/^/999999|/; s/$/|untested/' >> selected_quality.txt
           fi
 
           head -n "${MAX_SERVERS}" selected_quality.txt > temp_quality.txt
@@ -351,7 +411,7 @@ jobs:
 
           FINAL_COUNT=$(wc -l < selected.txt)
           echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
-          echo "Selected $FINAL_COUNT servers (hysteria priority, fastest by real TCP latency)"
+          echo "Selected $FINAL_COUNT servers (hysteria priority, fastest genuine handshake)"
 
       - name: Generate output files
         id: generate
@@ -377,7 +437,7 @@ jobs:
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
-            echo "# servers: $FINAL_COUNT (5 самых быстрых по тестам, приоритет hysteria)"
+            echo "# servers: $FINAL_COUNT (5 самых быстрых по реальному TLS/TCP тесту, приоритет hysteria)"
             echo "# total_links: $TOTAL_LINKS"
             echo "# Hysteria servers: $HYSTERIA_COUNT total"
             echo ""
