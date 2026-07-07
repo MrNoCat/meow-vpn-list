@@ -13,12 +13,13 @@ permissions:
 env:
   CONFIG_URL: "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt"
   MAX_SERVERS: 5             # Гарантированное количество серверов в итоговом файле
-  TIMEOUT: 3                 # Таймаут одной попытки подключения (TCP/TLS), сек
+  TIMEOUT: 3                 # Таймаут одной попытки подключения (TLS/TCP), сек
   PARALLEL_CHECKS: 20        # Параллельных проверок
   MAX_CHECK_SERVERS: 300     # Сколько hysteria-серверов реально тестируем за прогон
   MAX_CHECK_OTHERS: 200      # Сколько НЕ-hysteria серверов тестируем в fallback-е
   SAMPLES: 3                 # Сколько раз замеряем каждый сервер
-  LOSS_PENALTY_MS: 200       # Штраф (мс) за каждую неответившую попытку подключения
+  LOSS_PENALTY_MS: 200       # Штраф (мс) за каждую неответившую попытку
+  TCP_ONLY_PENALTY_MS: 100000  # Огромный штраф для TCP-only (без TLS-подтверждения) — всегда ниже TLS-серверов
 
 jobs:
   build:
@@ -158,26 +159,28 @@ jobs:
 
       - name: Prepare check function
         run: |
-          # ВАЖНО: голый TCP-connect легко подделать. DPI/файрвол (типично
-          # для РКН-блокировок) может сам ответить поддельным SYN-ACK на
-          # заблокированный/подозрительный хост, создавая иллюзию быстрого
-          # "пинга" (например 15ms), хотя реального сервера за этим нет и
-          # никакого трафика дальше не пройдёт. Именно поэтому "самые
-          # быстрые по TCP" сервера иногда оказываются полностью нерабочими
-          # в реальном клиенте (Happ и т.п.), а более медленный, но настоящий
-          # сервер — единственный рабочий.
+          # ПРИНЦИП ОТБОРА: TLS-хендшейк — ОСНОВНОЙ и приоритетный тест
+          # скорости для ЛЮБОГО сервера, независимо от того, что написано
+          # в параметре security= самой ссылки. Голый TCP-connect легко
+          # подделать: DPI/файрвол (типично для РКН-блокировок) может сам
+          # ответить поддельным SYN-ACK на заблокированный хост, создавая
+          # иллюзию быстрого "пинга" у сервера, который реально не работает.
+          # Подделать настоящий TLS-хендшейк с корректным SNI до реального
+          # сервера DPI не может — поэтому это единственный надёжный сигнал.
           #
-          # Решение: для серверов с security=tls/reality проверяем не
-          # TCP-connect, а ПОЛНЫЙ TLS-хендшейк (openssl s_client) с тем же
-          # SNI/ALPN, что в самой ссылке. DPI может подделать SYN-ACK, но
-          # не способен провести настоящий TLS handshake с реальным
-          # сертификатом до настоящего сервера — фейковые "серверы" сразу
-          # отсеиваются. Для security=none (без TLS) остаётся обычный
-          # TCP-connect, так как TLS-слоя там физически нет.
-          #
-          # Плюс требуем БОЛЬШИНСТВО успешных попыток из SAMPLES — один
-          # случайный успех (тоже типичный для нестабильного/спуфленного
-          # соединения) не засчитывается как рабочий сервер.
+          # Логика на сервер:
+          #   1) Пробуем TLS-хендшейк (openssl s_client, SNI/ALPN из ссылки).
+          #      Большинство успешных попыток -> сервер "TLS-подтверждён",
+          #      score = медиана реального TLS-времени + штраф за потери.
+          #   2) Если TLS не подтвердился (сервер реально без TLS или
+          #      недоступен) — пробуем TCP-connect как ПОСЛЕДНИЙ резерв.
+          #      Такой сервер помечается "TCP-only" и получает огромный
+          #      фиксированный штраф (TCP_ONLY_PENALTY_MS), поэтому в
+          #      итоговой сортировке ВСЕГДА окажется ниже любого
+          #      TLS-подтверждённого сервера, даже если его "голый" пинг
+          #      меньше.
+          #   3) Если не подтвердился ни TLS, ни TCP — сервер выбрасывается
+          #      полностью (return 1), в quality-файл не попадает.
           cat > check_server.sh << 'SCRIPT'
           check_server() {
             local link="$1"
@@ -199,14 +202,12 @@ jobs:
               return 1
             fi
 
-            # Достаём параметры из query-строки самой ссылки
+            # Достаём sni/alpn из query-строки ссылки (для честного TLS-теста)
             local query="${link#*\?}"
             query="${query%%#*}"
             [ "$query" = "$link" ] && query=""
 
-            local security sni alpn
-            security=$(echo "$query" | grep -oP '(?:^|&)security=\K[^&]*' | head -1)
-
+            local sni alpn
             sni=$(echo "$query" | grep -oP '(?:^|&)sni=\K[^&]*' | head -1)
             [ -z "$sni" ] && sni=$(echo "$query" | grep -oP '(?:^|&)host=\K[^&]*' | head -1)
             if [ -n "$sni" ]; then
@@ -219,94 +220,104 @@ jobs:
               alpn=$(printf '%b' "${alpn//%/\\x}" 2>/dev/null) || alpn=""
             fi
 
-            local use_tls=1
-            if [ "$security" = "none" ] || [ -z "$security" ]; then
-              use_tls=0
-            fi
+            local samples sent recv fails
+            local sorted n mid median loss loss_penalty score
 
-            local samples=() sent=0 recv=0 fails=0
-
+            # ==== ЭТАП 1: TLS handshake (основной, приоритетный тест) ====
+            samples=(); sent=0; recv=0; fails=0
             for _ in $(seq 1 "$SAMPLES"); do
               sent=$((sent + 1))
-              local start end elapsed_ms ok=0
-
+              local start end elapsed_ms ssl_out
               start=$(date +%s%N)
-
-              if [ "$use_tls" -eq 1 ]; then
-                local ssl_out
-                if [ -n "$alpn" ]; then
-                  ssl_out=$(echo | timeout "$TIMEOUT" openssl s_client \
-                    -connect "${host}:${port}" -servername "$sni" -alpn "$alpn" 2>/dev/null)
-                else
-                  ssl_out=$(echo | timeout "$TIMEOUT" openssl s_client \
-                    -connect "${host}:${port}" -servername "$sni" 2>/dev/null)
-                fi
-                if echo "$ssl_out" | grep -q "Cipher is"; then
-                  ok=1
-                fi
+              if [ -n "$alpn" ]; then
+                ssl_out=$(echo | timeout "$TIMEOUT" openssl s_client \
+                  -connect "${host}:${port}" -servername "$sni" -alpn "$alpn" 2>/dev/null)
               else
-                if timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
-                  exec 3<&- 3>&- 2>/dev/null || true
-                  ok=1
-                fi
+                ssl_out=$(echo | timeout "$TIMEOUT" openssl s_client \
+                  -connect "${host}:${port}" -servername "$sni" 2>/dev/null)
               fi
-
-              if [ "$ok" -eq 1 ]; then
+              if echo "$ssl_out" | grep -q "Cipher is"; then
                 end=$(date +%s%N)
                 elapsed_ms=$(( (end - start) / 1000000 ))
                 recv=$((recv + 1))
                 samples+=("$elapsed_ms")
               else
                 fails=$((fails + 1))
-                # Ранний выход: если сервер не ответил дважды подряд с самого
-                # начала, дальше не мучаем его оставшимися попытками.
                 if [ "$fails" -ge 2 ] && [ "$recv" -eq 0 ]; then
                   break
                 fi
               fi
             done
 
-            # Требуем большинство успешных попыток — единичный "везучий"
-            # (или спуфленный) ответ не считается рабочим сервером.
             local majority=$(( (sent + 1) / 2 ))
+            if [ "$recv" -gt 0 ] && [ "$recv" -ge "$majority" ]; then
+              sorted=($(printf '%s\n' "${samples[@]}" | sort -n))
+              n=${#sorted[@]}
+              mid=$(( n / 2 ))
+              if (( n % 2 == 1 )); then
+                median=${sorted[$mid]}
+              else
+                median=$(( (sorted[mid-1] + sorted[mid]) / 2 ))
+              fi
+              loss=$(( sent - recv ))
+              loss_penalty=$(( loss * LOSS_PENALTY_MS ))
+              score=$(( median + loss_penalty ))
+              echo "${score}|${link}|${median}ms TLS (${recv}/${sent} ok)"
+              return 0
+            fi
+
+            # ==== ЭТАП 2: TLS не подтвердился — пробуем TCP как резерв ====
+            samples=(); sent=0; recv=0; fails=0
+            for _ in $(seq 1 "$SAMPLES"); do
+              sent=$((sent + 1))
+              local start end elapsed_ms
+              start=$(date +%s%N)
+              if timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+                end=$(date +%s%N)
+                exec 3<&- 3>&- 2>/dev/null || true
+                elapsed_ms=$(( (end - start) / 1000000 ))
+                recv=$((recv + 1))
+                samples+=("$elapsed_ms")
+              else
+                fails=$((fails + 1))
+                if [ "$fails" -ge 2 ] && [ "$recv" -eq 0 ]; then
+                  break
+                fi
+              fi
+            done
+
+            majority=$(( (sent + 1) / 2 ))
             if [ "$recv" -eq 0 ] || [ "$recv" -lt "$majority" ]; then
               return 1
             fi
 
-            # Медиана по успешным замерам — устойчивее к всплескам, чем среднее
-            local sorted
             sorted=($(printf '%s\n' "${samples[@]}" | sort -n))
-            local n=${#sorted[@]}
-            local mid=$(( n / 2 ))
-            local median
+            n=${#sorted[@]}
+            mid=$(( n / 2 ))
             if (( n % 2 == 1 )); then
               median=${sorted[$mid]}
             else
               median=$(( (sorted[mid-1] + sorted[mid]) / 2 ))
             fi
-
-            local loss=$(( sent - recv ))
-            local loss_penalty=$(( loss * LOSS_PENALTY_MS ))
-            local score=$(( median + loss_penalty ))
-
-            local proto="TCP"
-            [ "$use_tls" -eq 1 ] && proto="TLS"
-
-            echo "${score}|${link}|${median}ms ${proto} (${recv}/${sent} ok)"
+            loss=$(( sent - recv ))
+            loss_penalty=$(( loss * LOSS_PENALTY_MS ))
+            # Огромный фиксированный штраф — TCP-only ВСЕГДА ниже любого TLS-сервера
+            score=$(( TCP_ONLY_PENALTY_MS + median + loss_penalty ))
+            echo "${score}|${link}|${median}ms TCP-only, no TLS (${recv}/${sent} ok)"
           }
           SCRIPT
 
           echo "check_server.sh ready"
 
-      - name: Check hysteria server quality (real TLS/TCP handshake)
+      - name: Check hysteria server quality (TLS-priority test)
         id: check
         run: |
           set -e
 
-          echo "Checking HYSTERIA server quality..."
+          echo "Checking HYSTERIA server quality (TLS-priority)..."
           source check_server.sh
           export -f check_server
-          export TIMEOUT SAMPLES LOSS_PENALTY_MS
+          export TIMEOUT SAMPLES LOSS_PENALTY_MS TCP_ONLY_PENALTY_MS
 
           TOTAL_HYSTERIA=$(wc -l < hysteria_servers.txt)
           CHECK_COUNT=$TOTAL_HYSTERIA
@@ -322,8 +333,9 @@ jobs:
           sort -t'|' -k1 -n hysteria_quality.txt > hysteria_quality_sorted.txt
 
           TESTED_COUNT=$(wc -l < hysteria_quality_sorted.txt)
+          TLS_COUNT=$(grep -c '|TLS ' hysteria_quality_sorted.txt || echo 0)
           echo "tested_count=$TESTED_COUNT" >> $GITHUB_OUTPUT
-          echo "Tested and genuinely reachable hysteria servers: $TESTED_COUNT"
+          echo "Tested and reachable hysteria servers: $TESTED_COUNT (TLS-confirmed: $TLS_COUNT)"
 
       - name: Fallback - test other servers if hysteria not enough
         id: fallback
@@ -340,7 +352,7 @@ jobs:
 
             source check_server.sh
             export -f check_server
-            export TIMEOUT SAMPLES LOSS_PENALTY_MS
+            export TIMEOUT SAMPLES LOSS_PENALTY_MS TCP_ONLY_PENALTY_MS
 
             CHECK_COUNT=$(wc -l < other_servers.txt)
             [ "$CHECK_COUNT" -gt "$MAX_CHECK_OTHERS" ] && CHECK_COUNT="$MAX_CHECK_OTHERS"
@@ -358,21 +370,23 @@ jobs:
 
           TESTED_OTHER=$(wc -l < other_quality_sorted.txt 2>/dev/null || echo 0)
           echo "tested_other=$TESTED_OTHER" >> $GITHUB_OUTPUT
-          echo "Tested and genuinely reachable other servers: $TESTED_OTHER"
+          echo "Tested and reachable other servers: $TESTED_OTHER"
 
-      - name: Select best servers (hysteria priority, fastest genuine handshake)
+      - name: Select best servers (hysteria priority, TLS-confirmed first)
         id: select
         run: |
           set -e
 
-          echo "Selecting ${MAX_SERVERS} servers: hysteria first (by real handshake latency), then fastest others to fill gaps..."
+          echo "Selecting ${MAX_SERVERS} servers: hysteria first, TLS-confirmed always ranked above TCP-only, fastest within each group..."
 
           > selected.txt
           > selected_quality.txt
 
-          # 1) Приоритет: сначала берём протестированные (реальным TLS/TCP
-          #    хендшейком) hysteria-сервера, отсортированные по score,
-          #    сколько наберётся (до MAX_SERVERS).
+          # 1) Приоритет: сначала берём протестированные hysteria-сервера.
+          #    Благодаря score (TLS-подтверждённые всегда < TCP_ONLY_PENALTY_MS,
+          #    TCP-only всегда >= TCP_ONLY_PENALTY_MS) сортировка сама
+          #    гарантирует TLS-серверы выше TCP-only, сколько наберётся
+          #    (до MAX_SERVERS).
           if [ -s hysteria_quality_sorted.txt ]; then
             head -n "${MAX_SERVERS}" hysteria_quality_sorted.txt >> selected_quality.txt
           fi
@@ -381,7 +395,8 @@ jobs:
           NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
 
           # 2) Если hysteria не хватило — добираем недостающие места
-          #    самыми быстрыми протестированными "остальными" серверами.
+          #    самыми быстрыми протестированными "остальными" серверами
+          #    (тоже с приоритетом TLS-подтверждённых благодаря score).
           if [ "$NEEDED" -gt 0 ] && [ -s other_quality_sorted.txt ]; then
             echo "::warning::Hysteria gave only $SELECTED_COUNT servers, filling $NEEDED slot(s) with fastest non-hysteria tested servers"
             head -n "$NEEDED" other_quality_sorted.txt >> selected_quality.txt
@@ -393,7 +408,7 @@ jobs:
           # 3) Крайний случай: даже вместе hysteria + fallback тест не дал
           #    MAX_SERVERS реально рабочих серверов. Добираем без теста
           #    (просто чтобы не терять количество), явно помечая как
-          #    непроверенные (untested) — они могут не работать.
+          #    untested — такие сервера могут не работать.
           if [ "$NEEDED" -gt 0 ]; then
             echo "::warning::Only $SELECTED_COUNT genuinely working servers found, padding with UNTESTED links to reach ${MAX_SERVERS} (may not work)"
             cut -d'|' -f2 selected_quality.txt > selected_links_tmp.txt
@@ -401,7 +416,7 @@ jobs:
               grep -Fvxf selected_links_tmp.txt | \
               awk '!seen[$0]++' | \
               head -n "$NEEDED" | \
-              sed 's/^/999999|/; s/$/|untested/' >> selected_quality.txt
+              sed 's/^/999999999|/; s/$/|untested/' >> selected_quality.txt
           fi
 
           head -n "${MAX_SERVERS}" selected_quality.txt > temp_quality.txt
@@ -410,8 +425,9 @@ jobs:
           cut -d'|' -f2 selected_quality.txt > selected.txt
 
           FINAL_COUNT=$(wc -l < selected.txt)
+          TLS_IN_FINAL=$(grep -c '|TLS ' selected_quality.txt || echo 0)
           echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
-          echo "Selected $FINAL_COUNT servers (hysteria priority, fastest genuine handshake)"
+          echo "Selected $FINAL_COUNT servers (TLS-confirmed among them: $TLS_IN_FINAL)"
 
       - name: Generate output files
         id: generate
@@ -437,7 +453,7 @@ jobs:
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
-            echo "# servers: $FINAL_COUNT (5 самых быстрых по реальному TLS/TCP тесту, приоритет hysteria)"
+            echo "# servers: $FINAL_COUNT (5 самых быстрых по TLS-тесту, приоритет hysteria)"
             echo "# total_links: $TOTAL_LINKS"
             echo "# Hysteria servers: $HYSTERIA_COUNT total"
             echo ""
@@ -476,7 +492,7 @@ jobs:
           <body>
             <h1>✅ Hysteria Lists - Updated: $DATE $TIME</h1>
             <div class="stats">
-              <div class="stat-item"><strong>Total servers:</strong> $FINAL_COUNT (5 fastest, hysteria priority)</div>
+              <div class="stat-item"><strong>Total servers:</strong> $FINAL_COUNT (5 fastest, TLS priority)</div>
               <div class="stat-item"><strong>Hysteria servers found:</strong> $HYSTERIA_COUNT</div>
               <div class="stat-item"><strong>Total links checked:</strong> $TOTAL_LINKS</div>
             </div>
