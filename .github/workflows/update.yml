@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  CONFIG_URL: "https://github.com/zieng2/wl/blob/main/vless_lite.txt"
+  CONFIG_URL: "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt"
   MAX_SERVERS: 5             # Гарантированное количество серверов в итоговом файле
   TIMEOUT: 3                 # Таймаут одной попытки подключения (TLS/TCP), сек
   PARALLEL_CHECKS: 20        # Параллельных проверок
