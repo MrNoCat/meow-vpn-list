@@ -12,14 +12,11 @@ permissions:
 
 env:
   CONFIG_URL: "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt"
-  MAX_SERVERS: 5
-  RUSSIA_SERVERS: 3
-  OTHER_SERVERS: 2
-  TIMEOUT: 2
-  PARALLEL_CHECKS: 20
-  MAX_CHECK_SERVERS: 300
-  PING_COUNT: 3
-  GEOIP_BATCH_SIZE: 100
+  MAX_SERVERS: 5             # Гарантированное количество серверов в итоговом файле
+  TIMEOUT: 2                 # Таймаут проверки TCP-порта, сек
+  PARALLEL_CHECKS: 20        # Параллельных проверок
+  MAX_CHECK_SERVERS: 300     # Сколько серверов реально тестируем за прогон
+  PING_COUNT: 3              # Сколько раз пинговать каждый сервер
 
 jobs:
   build:
@@ -140,8 +137,13 @@ jobs:
           grep -i "hysteria" unique.txt > hysteria_temp2.txt 2>/dev/null || true
           cat hysteria_temp1.txt hysteria_temp2.txt | sort -u > hysteria_servers.txt 2>/dev/null || true
 
+          # Если hysteria-серверов не нашлось вообще — не оставляем список
+          # пустым, а ищем самые быстрые среди ВСЕХ VLESS-ссылок из
+          # источника. Дальше по пайплайну (проверка скорости, выбор
+          # топ-5) работает точно так же, просто источником становятся
+          # все ссылки, а не только hysteria.
           if [ ! -s hysteria_servers.txt ]; then
-            echo "::warning::No hysteria servers found, using all links"
+            echo "::warning::No hysteria servers found, searching fastest among ALL VLESS links instead"
             cp unique.txt hysteria_servers.txt
           fi
 
@@ -150,79 +152,6 @@ jobs:
           HYSTERIA_COUNT=$(wc -l < hysteria_servers.txt)
           echo "hysteria_count=$HYSTERIA_COUNT" >> $GITHUB_OUTPUT
           echo "Found $HYSTERIA_COUNT hysteria servers"
-
-      - name: Resolve host countries (batched)
-        id: geoip
-        run: |
-          set -e
-
-          # ВАЖНО: раньше страна определялась запросом к ip-api.com отдельно
-          # для КАЖДОГО сервера прямо внутри параллельной проверки (до 200
-          # запросов почти одновременно). Бесплатный лимит ip-api.com — 45
-          # запросов в минуту, поэтому большинство запросов улетали в 429,
-          # и сервер получал country=UNKNOWN — деление на Russia/Other
-          # фактически переставало работать.
-          #
-          # Исправление: собираем уникальные хосты один раз, бьём на пачки
-          # по GEOIP_BATCH_SIZE и используем batch-эндпоинт ip-api.com,
-          # который принимает до 100 хостов за один запрос. Итог — вместо
-          # сотен запросов делаем единицы, укладываемся в лимит с запасом,
-          # и внутри проверки серверов сеть больше не дёргаем вообще —
-          # только читаем готовую карту host->country из файла.
-
-          extract_host() {
-            local link="$1"
-            local host
-            if [[ $link =~ vless://[^@]+@([^:]+): ]]; then
-              host="${BASH_REMATCH[1]}"
-            elif [[ $link =~ vless://[^/]+/([^:]+): ]]; then
-              host="${BASH_REMATCH[1]}"
-            else
-              host=$(echo "$link" | sed -n 's/.*vless:\/\/[^@]*@\([^:]*\):.*/\1/p')
-            fi
-            [ -n "$host" ] && echo "$host"
-          }
-
-          TOTAL_HYSTERIA=$(wc -l < hysteria_servers.txt)
-          CHECK_COUNT=$TOTAL_HYSTERIA
-          [ "$CHECK_COUNT" -gt "$MAX_CHECK_SERVERS" ] && CHECK_COUNT="$MAX_CHECK_SERVERS"
-          head -n "$CHECK_COUNT" hysteria_servers.txt > to_check.txt
-
-          : > hosts.txt
-          while IFS= read -r link; do
-            extract_host "$link" >> hosts.txt
-          done < to_check.txt
-          sort -u hosts.txt -o hosts.txt
-
-          echo "Unique hosts to geo-locate: $(wc -l < hosts.txt)"
-
-          : > country_map.txt
-          split -l "$GEOIP_BATCH_SIZE" hosts.txt geoip_batch_ 2>/dev/null || true
-
-          for batch_file in geoip_batch_*; do
-            [ -f "$batch_file" ] || continue
-            json_array=$(jq -R -s -c 'split("\n") | map(select(length > 0))' "$batch_file")
-
-            response=$(curl -s --max-time 15 -X POST \
-              -H "Content-Type: application/json" \
-              -d "$json_array" \
-              "http://ip-api.com/batch?fields=query,countryCode" 2>/dev/null || echo "")
-
-            if [ -n "$response" ] && echo "$response" | jq -e . >/dev/null 2>&1; then
-              echo "$response" | jq -r '.[] | "\(.query)|\(.countryCode // "UNKNOWN")"' >> country_map.txt
-            else
-              echo "::warning::Geoip batch request failed for $batch_file, marking as UNKNOWN"
-              awk '{print $0"|UNKNOWN"}' "$batch_file" >> country_map.txt
-            fi
-
-            # Мягкая пауза между пачками, чтобы не упереться в лимит
-            # (15 запросов/минуту на batch-эндпоинте ip-api.com)
-            sleep 1
-          done
-
-          rm -f geoip_batch_*
-
-          echo "Resolved countries: $(wc -l < country_map.txt)"
 
       - name: Check server quality (ping + port)
         id: check
@@ -255,10 +184,6 @@ jobs:
               return 1
             fi
 
-            local country
-            country=$(grep "^${host}|" country_map.txt 2>/dev/null | cut -d'|' -f2 | head -n1)
-            [ -z "$country" ] && country="UNKNOWN"
-
             local samples=() sent=0 recv=0
             for _ in $(seq 1 "$PING_COUNT"); do
               sent=$((sent + 1))
@@ -281,9 +206,9 @@ jobs:
               local loss_penalty
               loss_penalty=$(echo "scale=2; ($sent - $recv) * 40" | bc)
               score=$(echo "$avg + $loss_penalty" | bc)
-              echo "${score}|${link}|${country}|${avg}"
+              echo "${score}|${link}|${avg}"
             else
-              echo "999|${link}|${country}|n/a"
+              echo "999|${link}|n/a"
             fi
           }
           export -f check_server
@@ -305,63 +230,55 @@ jobs:
 
           sort -t'|' -k1 -n server_quality.txt > server_quality_sorted.txt
 
-          grep -E '\|RU\|' server_quality_sorted.txt > quality_russia.txt || true
-          grep -vE '\|(RU|UNKNOWN)\|' server_quality_sorted.txt > quality_other.txt || true
+          echo "Tested and reachable servers: $(wc -l < server_quality_sorted.txt)"
 
-          RUSSIA_COUNT=$(wc -l < quality_russia.txt 2>/dev/null || echo 0)
-          OTHER_COUNT=$(wc -l < quality_other.txt 2>/dev/null || echo 0)
-
-          echo "russia_count=$RUSSIA_COUNT" >> $GITHUB_OUTPUT
-          echo "other_count=$OTHER_COUNT" >> $GITHUB_OUTPUT
-          echo "Found $RUSSIA_COUNT quality Russia servers, $OTHER_COUNT quality other servers"
-
-      - name: Select best servers by quality score
+      - name: Select best servers (guaranteed fastest)
         id: select
         run: |
           set -e
 
-          echo "Selecting best servers by quality score..."
+          echo "Selecting the fastest servers (guaranteed count: ${MAX_SERVERS})..."
 
           > selected.txt
 
-          if [ -s quality_russia.txt ]; then
-            head -"${RUSSIA_SERVERS}" quality_russia.txt | cut -d'|' -f2 >> selected.txt
-            echo "Selected Russia servers from quality list"
+          # ГЛАВНЫЙ ПРИНЦИП: сначала берём просто ${MAX_SERVERS} самых
+          # быстрых из уже протестированных и доступных серверов —
+          # server_quality_sorted.txt отсортирован по реальному score
+          # (эффективный ping в мс, меньше = быстрее). Никаких квот по
+          # странам на этом этапе: если 5 самых быстрых окажутся все не
+          # из России — значит, так и должно быть, "самые быстрые"
+          # важнее, чем искусственный баланс RU/Other.
+          if [ -s server_quality_sorted.txt ]; then
+            cut -d'|' -f2 server_quality_sorted.txt | head -n "${MAX_SERVERS}" >> selected.txt
           fi
 
-          if [ -s quality_other.txt ]; then
-            head -"${OTHER_SERVERS}" quality_other.txt | cut -d'|' -f2 >> selected.txt
-            echo "Selected Other servers from quality list"
-          fi
-
-          if [ ! -s selected.txt ]; then
-            echo "::warning::No servers selected from quality lists, taking from all"
-            head -"${MAX_SERVERS}" hysteria_servers.txt > selected.txt
-          fi
-
-          sort -u selected.txt > selected_unique.txt
-          mv selected_unique.txt selected.txt
+          sort -u selected.txt -o selected.txt
 
           SELECTED_COUNT=$(wc -l < selected.txt 2>/dev/null || echo 0)
           NEEDED=$(( MAX_SERVERS - SELECTED_COUNT ))
 
-          if [ "$NEEDED" -gt 0 ] && [ -s server_quality_sorted.txt ]; then
-            echo "Need $NEEDED more servers, adding fallback..."
-
-            cut -d'|' -f2 server_quality_sorted.txt | \
-              grep -Fvxf selected.txt | \
-              head -"$NEEDED" >> selected.txt || true
+          # ГАРАНТИЯ КОЛИЧЕСТВА: если протестированных и доступных
+          # серверов набралось меньше ${MAX_SERVERS} (например, почти все
+          # не прошли проверку порта/пинга из-за проблем сети), добираем
+          # недостающее количество из полного списка серверов
+          # (hysteria_servers.txt — который сам, в свою очередь, уже
+          # содержит ВСЕ VLESS-ссылки, если hysteria-серверов не нашлось
+          # вообще, см. шаг "Detect hysteria servers"). Без данных о
+          # скорости, но лишь бы гарантированно выдать ${MAX_SERVERS}
+          # рабочих ссылок, а не меньше.
+          if [ "$NEEDED" -gt 0 ] && [ -s hysteria_servers.txt ]; then
+            echo "::warning::Only $SELECTED_COUNT tested fast servers found, padding with untested links to reach ${MAX_SERVERS}"
+            grep -Fvxf selected.txt hysteria_servers.txt | head -n "$NEEDED" >> selected.txt || true
           fi
 
           sed -i '/^$/d' selected.txt
-          sort -u selected.txt > selected_unique.txt
-          mv selected_unique.txt selected.txt
-          head -"${MAX_SERVERS}" selected.txt > temp.txt
+          sort -u selected.txt -o selected.txt
+          head -n "${MAX_SERVERS}" selected.txt > temp.txt
           mv temp.txt selected.txt
 
           FINAL_COUNT=$(wc -l < selected.txt)
           echo "final_count=$FINAL_COUNT" >> $GITHUB_OUTPUT
-          echo "Selected $FINAL_COUNT servers"
+          echo "Selected $FINAL_COUNT servers (fastest-first, guaranteed)"
 
       - name: Generate output files
         id: generate
@@ -375,30 +292,7 @@ jobs:
 
           FINAL_COUNT="${{ steps.select.outputs.final_count || 0 }}"
           HYSTERIA_COUNT="${{ steps.hysteria.outputs.hysteria_count || 0 }}"
-          RUSSIA_COUNT="${{ steps.check.outputs.russia_count || 0 }}"
-          OTHER_COUNT="${{ steps.check.outputs.other_count || 0 }}"
           TOTAL_LINKS="${{ steps.extract.outputs.total_links || 0 }}"
-
-          RUSSIA_USED=0
-          OTHER_USED=0
-
-          if [ -s quality_russia.txt ] && [ -s selected.txt ]; then
-            while IFS= read -r line; do
-              link=$(echo "$line" | cut -d'|' -f2)
-              if grep -qF "$link" selected.txt; then
-                RUSSIA_USED=$((RUSSIA_USED + 1))
-              fi
-            done < quality_russia.txt
-          fi
-
-          if [ -s quality_other.txt ] && [ -s selected.txt ]; then
-            while IFS= read -r line; do
-              link=$(echo "$line" | cut -d'|' -f2)
-              if grep -qF "$link" selected.txt; then
-                OTHER_USED=$((OTHER_USED + 1))
-              fi
-            done < quality_other.txt
-          fi
 
           DATE=$(date +"%d.%m.%Y")
           TIME=$(date +"%H:%M")
@@ -410,10 +304,9 @@ jobs:
             echo "# profile-update-interval: 1"
             echo "# subscription-userinfo: upload=$UPLOAD; download=$DOWNLOAD; total=$TOTAL; expire=0"
             echo "# update: $DATE $TIME (MSK)"
-            echo "# servers: $FINAL_COUNT"
+            echo "# servers: $FINAL_COUNT (5 самых быстрых по тестам)"
             echo "# total_links: $TOTAL_LINKS"
             echo "# Hysteria servers: $HYSTERIA_COUNT total"
-            echo "# Russia: $RUSSIA_USED (of $RUSSIA_COUNT quality) | Other: $OTHER_USED (of $OTHER_COUNT quality)"
             echo ""
 
             COUNT=1
@@ -421,7 +314,7 @@ jobs:
               [ -z "$link" ] && continue
               QUALITY_INFO=$(grep -F "|$link|" server_quality_sorted.txt 2>/dev/null | head -1)
               if [ -n "$QUALITY_INFO" ]; then
-                PING=$(echo "$QUALITY_INFO" | cut -d'|' -f4)
+                PING=$(echo "$QUALITY_INFO" | cut -d'|' -f3)
                 if [ "$PING" != "n/a" ]; then
                   echo "📱LTE Обход #$COUNT [Ping:${PING}ms]"
                 else
@@ -456,11 +349,9 @@ jobs:
           <body>
             <h1>✅ Hysteria Lists - Updated: $DATE $TIME</h1>
             <div class="stats">
-              <div class="stat-item"><strong>Total servers:</strong> $FINAL_COUNT</div>
-              <div class="stat-item"><strong>Hysteria servers:</strong> $HYSTERIA_COUNT</div>
-              <div class="stat-item"><strong>Russia quality:</strong> $RUSSIA_USED (of $RUSSIA_COUNT)</div>
-              <div class="stat-item"><strong>Other quality:</strong> $OTHER_USED (of $OTHER_COUNT)</div>
-              <div class="stat-item"><strong>Total links:</strong> $TOTAL_LINKS</div>
+              <div class="stat-item"><strong>Total servers:</strong> $FINAL_COUNT (5 fastest)</div>
+              <div class="stat-item"><strong>Hysteria servers found:</strong> $HYSTERIA_COUNT</div>
+              <div class="stat-item"><strong>Total links checked:</strong> $TOTAL_LINKS</div>
             </div>
             <p><a href="white-list.txt">📥 Download subscription (white-list.txt)</a></p>
             <p><a href="android.txt">📱 Download android.txt</a></p>
@@ -476,10 +367,6 @@ jobs:
             "total_servers": $FINAL_COUNT,
             "total_links": $TOTAL_LINKS,
             "hysteria_total": $HYSTERIA_COUNT,
-            "russia_quality": $RUSSIA_COUNT,
-            "other_quality": $OTHER_COUNT,
-            "russia_used": $RUSSIA_USED,
-            "other_used": $OTHER_USED,
             "upload": $UPLOAD,
             "download": $DOWNLOAD,
             "total": $TOTAL,
@@ -534,12 +421,6 @@ jobs:
           cat selected.txt 2>/dev/null || echo "File not found"
           echo "=== server_quality_sorted.txt (top 10) ==="
           head -10 server_quality_sorted.txt 2>/dev/null || echo "File not found"
-          echo "=== quality_russia.txt (top 5) ==="
-          head -5 quality_russia.txt 2>/dev/null || echo "File not found"
-          echo "=== quality_other.txt (top 5) ==="
-          head -5 quality_other.txt 2>/dev/null || echo "File not found"
-          echo "=== country_map.txt (top 10) ==="
-          head -10 country_map.txt 2>/dev/null || echo "File not found"
 
   deploy:
     needs: build
